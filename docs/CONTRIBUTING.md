@@ -1,13 +1,13 @@
 # GitGuard 开发规范
 
 > 适用于日常开发与代码评审。模块边界与依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)，安全边界见 [SECURITY.md](SECURITY.md)，AI 代理的执行约定见 [../AGENTS.md](../AGENTS.md)。
-> Week 1 的原始周计划保留在 [WEEK-1.md](WEEK-1.md)，属于历史文档；本文件是长期有效的工程规范。
+> Week 1 的原始周计划保留在 [develop/WEEK-1.md](develop/WEEK-1.md)，属于历史文档；本文件是长期有效的工程规范。
 
 ## 1. 阶段与范围
 
-当前处于 Week 1 原型阶段，仓库只提供 `pre-push` Hook 原型、共享类型、原型策略与最小桌面入口。
+当前处于**推送二次确认 MVP 阶段**（仅 macOS / Linux）：`pre-push` Hook、`gitguard-cli` 的配置/确认流程、Unix Domain Socket IPC、桌面端确认界面、仓库登记与 Hook 安装均已实现。
 
-- 规划中但尚未实现的模块不得在代码、UI、文档中声明为可用：SQLite、身份与仓库管理、正式策略配置、IPC、确认 UI、一次性批准、Hook 安装/升级/卸载、系统凭据库、日志脱敏。
+- 规划中但尚未实现的模块不得在代码、UI、文档中声明为可用：SQLite 与数据模型、身份/remote 管理、正式策略配置与优先级计算、Hook 升级与完整性校验、系统凭据库、日志脱敏与审计、Windows 实现、三平台真实环境验收。
 - 新增能力前先确认它属于当前阶段目标；跨阶段功能应先更新路线图再实现。
 - 所有放行决定必须来自 Rust；前端只负责展示与交互。
 
@@ -38,15 +38,16 @@ pnpm tauri dev    # 前端 + Tauri 桌面容器
 cargo build -p gitguard-cli
 ```
 
-手动试验 Hook 时，只在一次性临时仓库中进行：
+手动试验 Hook 时，优先在一次性临时仓库中进行：
 
 ```bash
 git rev-parse --git-path hooks/pre-push   # 先确认目标路径
 cargo build -p gitguard-cli
 ```
 
-- 原型必须显式传入 `--policy`，没有默认放行路径。
-- 不要在个人日常仓库安装原型 Hook；当前没有安装器，也不会备份或恢复已有 Hook。
+- 真实模式（`gitguard hook pre-push <remote-name> <remote-url>`）读配置后自动选择确认通道：有控制终端时在终端确认，否则走 IPC 请求桌面端；`--policy` 调试模式不读配置也不发 IPC。
+- 桌面端「添加仓库」会安装 Hook；已存在的用户 Hook 会先备份为 `pre-push.gitguard-backup` 并链式调用，不得改成直接覆盖。
+- 不要在个人日常仓库反复试验；调试确认流程时用临时仓库，避免误触真实远端。
 
 ## 4. 分支、提交与评审
 
@@ -76,8 +77,9 @@ cargo build -p gitguard-cli
 - 统一继承 workspace 配置：`version`、`edition`、`rust-version`、`license` 使用 `.workspace = true`；内部 crate 依赖通过 `[workspace.dependencies]` 声明。
 - 必须通过 `rustfmt` 默认格式与 `clippy -D warnings`；不要用 `#[allow(...)]` 掩盖问题。
 - 错误处理：
-  - 可预期错误使用 `GitGuardError`（`InvalidInput` / `PolicyUnavailable` / `Io` / `Internal`）。
+  - 可预期错误使用 `GitGuardError`（`InvalidInput` / `PolicyUnavailable` / `Io` / `Internal` / `IpcError`）。
   - 新错误变体必须同步 `exit_code_for_error` 与退出码测试，保持 README 中的退出码表有效。
+  - IPC 失败必须映射为 `IpcError`（退出码 7），不得降级成拒绝以外的成功路径。
   - 外部输入不使用 `unwrap()`；`expect()` 仅用于测试或启动期不可恢复错误，消息须说明不变量。
   - 不使用 `io::Error::new(io::ErrorKind::Other, ..)`，改用 `io::Error::other(..)`。
 - 不使用日志文本驱动业务行为；错误信息只写 `stderr`。
@@ -93,7 +95,8 @@ cargo build -p gitguard-cli
 - 保留语义化标签与可访问性属性（如 `aria-labelledby`）。
 - 用户可见文案统一放在 `src/i18n/messages/{zh-CN,en-US}.ts`，组件通过 `useI18n()` 获取，不硬编码字符串。
 - 新增语言或文案时同步补齐所有语言包；`en-US` 使用 `satisfies MessageSchema` 校验结构，缺少 key 会在 `pnpm type-check` 阶段失败。
-- Tauri command 返回稳定状态码而非面向用户的句子；状态码到文案的映射、白名单校验与未知值降级放在 `src/i18n` 内。
+- Tauri command 返回稳定错误码或枚举值而非面向用户的句子；白名单校验、未知值降级与状态码到文案的映射放在 `src/statusCodes.ts`，command 返回值的形状校验放在 `src/api.ts`。
+- 形状不完整或无法识别的返回值必须降级为「没有待确认请求」或 fail-closed 文案，不得凭空构造可确认的界面。
 - 前端语言切换只影响展示，不参与策略判断，也不构成安全控制。
 - 样式使用 `scoped`；新增 UI 库、状态库或路由前先更新技术栈说明。
 - `pnpm lint`、`pnpm type-check`、`pnpm build` 必须无告警通过。
@@ -130,7 +133,8 @@ cargo build -p gitguard-cli
 
 - 文件为 `crates/gitguard-cli/tests/git_hook.rs`，整体 `#![cfg(unix)]`；Windows 真实环境验证仍为待办。
 - 只使用 `tempfile` 创建的临时目录：一个工作仓库 + 一个本地 bare remote。
-- 子进程环境固定为 `GIT_CONFIG_GLOBAL=/dev/null`、`GIT_CONFIG_SYSTEM=/dev/null`、`GIT_TERMINAL_PROMPT=0`，并禁用交互。
+- 子进程环境固定为 `GIT_CONFIG_GLOBAL=/dev/null`、`GIT_CONFIG_SYSTEM=/dev/null`、`GIT_TERMINAL_PROMPT=0`，并通过隔离的 `HOME` / `XDG_CONFIG_HOME` 让配置落到临时目录。
+- 集成测试的子进程没有控制终端，因此走的是桌面端/IPC 通道；终端确认通道（`crates/gitguard-cli/src/terminal.rs`）由内存读写模拟终端输入的单元测试覆盖，不得为了跑通测试而放宽 Hook 里的检查。
 - 调用 Git 使用 `Command` 的参数数组；禁止字符串拼接 shell 命令。shell 仅出现在临时 Hook 脚本内，路径需转义。
 - 断言推送被阻止时，必须同时断言远端 ref 未变化。
 - 不访问真实远端、网络或用户日常仓库。
@@ -148,7 +152,7 @@ cargo build -p gitguard-cli
 - [ ] 没有新增网络请求、遥测、云同步或后台常驻服务。
 - [ ] 没有将 Token、私钥、环境变量或含密码 URL 写入代码、日志、错误信息或测试夹具。
 - [ ] 没有把外部输入拼接为 shell 命令；外部程序调用使用参数数组。
-- [ ] 没有自动安装、覆盖或删除用户仓库中的 Hook。
+- [ ] 没有静默安装、覆盖或删除用户仓库中的 Hook；外来 Hook 必须先备份并链式调用。
 - [ ] 没有把前端隐藏、按钮状态或本地缓存当作安全控制。
 - [ ] 没有把 `user.name`、`user.email` 当作远端认证身份。
 
@@ -158,6 +162,7 @@ cargo build -p gitguard-cli
 2. 说明用途、维护状态、许可证与体积影响。
 3. 内部 crate 使用 workspace 依赖；仅测试使用的放 `dev-dependencies`。
 4. 更新并提交 lockfile，确保 `--frozen-lockfile` 与 CI 可复现。
+5. 前端需要新的 Tauri 插件或系统能力时，在 `apps/desktop/src-tauri/capabilities/default.json` 只声明用到的最小权限（目录选择只需要 `dialog:allow-open`），不要整包放开。
 
 ## 9. 提交前检查
 

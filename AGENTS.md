@@ -6,13 +6,16 @@
 
 GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScript + Vite，桌面容器为 Tauri 2，核心逻辑位于 Rust Cargo Workspace。
 
-当前仓库处于 **Week 1 原型阶段**，实际存在的能力只有：
+当前仓库处于 **推送二次确认 MVP 阶段**（仅 macOS / Linux），实际存在的能力是：
 
-- `gitguard hook pre-push --policy <allow|deny|confirm|unavailable>`：读取 Hook stdin、逐行解析 ref、调用原型策略、映射稳定退出码。
-- Tauri 最小入口与一个只读的开发状态命令。
+- `gitguard hook pre-push <remote-name> <remote-url>`：读取 Hook stdin、逐行解析 ref、按本地配置选择确认通道（终端 / 桌面端），确认后重新校验 ref 并映射稳定退出码。
+- `gitguard hook pre-push --policy <allow|deny|confirm|unavailable>`：不读配置、不发 IPC 的原型调试模式。
+- 终端确认：`crates/gitguard-cli/src/terminal.rs` 通过 `/dev/tty` 在当前终端展示 remote、ref 与待推送 commit，分页浏览，输入 `y`/`yes` 确认。
+- 桌面端：Unix Domain Socket IPC 服务、待确认请求列表与提交预览、用户输入 `yes` 后重新校验 ref 并回 `Confirmed`（不执行 Git 命令）、仓库登记与 Hook 安装、超时设置。
+- `gitguard-hook`：Hook 安装 / 卸载 / 健康检查，外来 Hook 备份为 `pre-push.gitguard-backup` 并链式调用。
 - Rust 单元测试，以及 Unix 上真实执行 `git push` 的集成测试。
 
-**尚不存在**：SQLite 与数据模型、身份/仓库/remote 管理、正式策略配置、IPC、确认 UI、一次性批准、Hook 安装/升级/卸载、系统凭据库、日志脱敏、跨平台真实环境验收。
+**尚不存在**：SQLite 与数据模型、身份/remote 管理、正式策略配置与优先级计算、一次性批准之外的授权模型、Hook 升级与完整性校验、系统凭据库、日志脱敏与审计、跨平台（Windows）实现、三平台真实环境验收。
 
 因此：
 
@@ -26,19 +29,23 @@ GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScrip
 3. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：依赖方向与模块职责。
 4. 本文件与 [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)：工程规范。
 5. 现有代码与测试：实际行为。
-6. [docs/WEEK-1.md](docs/WEEK-1.md)（历史周计划）与 [docs/GitGuard*MVP*开发计划.md](docs/GitGuard_MVP_开发计划.md)（路线图）：与代码冲突时以代码为准，并顺手修正文档。
+6. [docs/develop/WEEK-1.md](docs/develop/WEEK-1.md)（历史周计划）与 [docs/develop/GitGuard*MVP*开发计划.md](docs/develop/GitGuard_MVP_开发计划.md)（路线图）：与代码冲突时以代码为准，并顺手修正文档。
 
 ## 3. 仓库地图
 
-| 路径                       | 职责                                                                            |
-| -------------------------- | ------------------------------------------------------------------------------- |
-| `crates/gitguard-core`     | `Decision`、`PolicyResult`、`RefUpdate`、`GitGuardError`、`CliExitCode`         |
-| `crates/gitguard-policy`   | 原型策略 `evaluate` 与 `PrototypePolicy`，纯逻辑                                |
-| `crates/gitguard-cli`      | 参数校验、完整读取 stdin、逐行解析 ref、调用策略、退出码映射（bin：`gitguard`） |
-| `apps/desktop/src`         | Vue 界面、i18n 语言包与状态码映射，只展示状态，不做策略判断                     |
-| `apps/desktop/src-tauri`   | Tauri 入口与 commands，不实现策略                                               |
-| `docs/`                    | 架构、安全、Week 1 计划、MVP 路线图                                             |
-| `.github/workflows/ci.yml` | 唯一 CI 流水线                                                                  |
+| 路径                       | 职责                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------ |
+| `crates/gitguard-core`     | `Decision`、`PolicyResult`、`RefUpdate`、推送确认请求/响应、`GitGuardError`、`CliExitCode` |
+| `crates/gitguard-policy`   | 原型策略 `evaluate` 与 `PrototypePolicy`，纯逻辑，仅供 `--policy` 调试模式                 |
+| `crates/gitguard-config`   | 本地 JSON 配置读写（全局默认值、仓库开关、Hook 状态），原子写入，不做策略                  |
+| `crates/gitguard-ipc`      | Unix Domain Socket 的 JSON 传输层、超时与 socket 权限（`0600`），不做策略                  |
+| `crates/gitguard-hook`     | `pre-push` Hook 安装/卸载/健康检查与备份链式调用，不判断是否推送                           |
+| `crates/gitguard-cli`      | 参数校验、完整读取 stdin、逐行解析 ref、选择确认通道、退出码映射（bin：`gitguard`）        |
+| `crates/gitguard-git`      | 仓库根路径、Hook 目录、提交列表、ref 预校验（`Command` 参数数组，不执行 push，不做策略）   |
+| `apps/desktop/src`         | Vue 界面、i18n 语言包、状态码映射与返回值形状校验，只展示状态，不做策略判断                |
+| `apps/desktop/src-tauri`   | `AppState`、IPC 服务端、Tauri commands；确认时只回 `Confirmed`，不执行 Git                 |
+| `docs/`                    | 架构、安全、开发规范与历史计划                                                             |
+| `.github/workflows/ci.yml` | 唯一 CI 流水线                                                                             |
 
 ## 4. 环境与命令
 
@@ -62,13 +69,21 @@ GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScrip
 ## 5. 架构硬约束
 
 ```text
-Vue UI → Tauri commands → gitguard-core
+Vue UI → Tauri commands → gitguard-hook / gitguard-git / gitguard-config / gitguard-ipc → gitguard-core
 Git pre-push Hook → gitguard-cli → gitguard-policy → gitguard-core
+Git pre-push Hook → gitguard-cli → gitguard-config / gitguard-git / gitguard-ipc
+gitguard-cli → /dev/tty（终端确认通道）
+gitguard-cli ⇄ Unix Domain Socket ⇄ Tauri commands
 ```
 
 - `gitguard-core`：只放共享数据、错误与退出码；不执行 Git，不依赖 Tauri、Vue、数据库或 shell。
-- `gitguard-policy`：纯策略判断；不得访问 UI/数据库、弹窗、执行命令、读取时间或随机数；无法判断时不得返回 `Allow`。
-- `gitguard-cli`：只做协议层工作（参数、stdin、ref 解析、退出码映射）；不得吞掉错误返回成功，不得把未校验输入拼进 shell 命令。
+- `gitguard-policy`：纯策略判断；不得访问 UI/数据库、弹窗、执行命令、读取时间或随机数；无法判断时不得返回 `Allow`。仅在 `--policy` 调试模式下使用。
+- `gitguard-cli`：只做协议层工作（参数、stdin、ref 解析、选择确认通道、退出码映射）；不得吞掉错误返回成功，不得把未校验输入拼进 shell 命令；确认通过后必须重新校验 ref 并以 0 放行，让原 `git push` 完成唯一一次推送，不得自己再执行 push。
+- `gitguard-cli` 的终端界面：交互只读写 `/dev/tty`（Hook stdin 已被 Git 占用），渲染前必须过滤控制字符、ANSI 与 bidi 控制符并脱敏 URL 凭据；分页、超时与未知输入都不得被视为确认。
+- `gitguard-git`：只封装 Git 调用（仓库根路径、Hook 目录、提交列表、ref 预校验）；不判断策略，不拼 shell，不执行 push，统一设置 `GIT_TERMINAL_PROMPT=0`，OID 与 ref 先校验再传给 Git。
+- `gitguard-ipc`：只搬运请求/响应；通信失败一律返回 `IpcError`，不得把「没有响应」当成确认。
+- `gitguard-hook`：只管理 Hook 文件；不得覆盖未备份的用户 Hook，不得启动常驻进程。
+- `apps/desktop/src-tauri`：不实现策略，也不执行 Git 命令；确认时先重新校验 ref 再回 `Confirmed`，推送由原 `git push` 完成。
 - `apps/desktop`：不得实现策略；前端状态与隐藏按钮不构成安全控制，放行决定只能来自 Rust。
 - 新增 crate 或调整依赖方向前，先更新 `docs/ARCHITECTURE.md` 并在改动说明中讲清理由。
 
@@ -111,7 +126,8 @@ Git pre-push Hook → gitguard-cli → gitguard-policy → gitguard-core
 
 ## 8. 安全红线
 
-- 未知、非法或不可判断一律 fail-closed；只有显式 `Decision::Allow` 映射为 0。
+- 未知、非法或不可判断一律 fail-closed；只有显式 `Decision::Allow` 或「用户确认 + ref 重新校验通过」映射为 0。
+- 终端与日志输出前必须过滤控制字符、ANSI/bidi 序列，并脱敏含凭据的 URL。
 - 不新增网络请求、云同步、遥测或后台常驻服务。
 - 不记录 Token、私钥、完整环境变量或含密码的 URL；错误信息只写 `stderr`。
 - 不把 Hook stdin、ref、remote、URL 或 Git 配置拼接成 shell 命令。
@@ -142,6 +158,6 @@ Git pre-push Hook → gitguard-cli → gitguard-policy → gitguard-core
 - [ ] `cargo fmt --all -- --check`、`cargo clippy ... -D warnings`、`cargo test --workspace` 通过。
 - [ ] 新增或变更的公开行为有测试，拒绝路径断言了远端 ref 未变化。
 - [ ] 代码放在正确的 crate，没有破坏依赖方向。
-- [ ] 所有失败路径仍返回非零退出码，没有静默放行。
+- [ ] 所有失败路径仍返回非零退出码，没有静默放行；确认路径只返回 0 且不重复推送。
 - [ ] README / ARCHITECTURE / SECURITY 等相关文档已同步，未声明未实现的功能。
 - [ ] 没有引入未声明的依赖、秘密、网络调用或 CI 绕过。

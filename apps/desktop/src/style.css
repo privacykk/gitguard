@@ -1,0 +1,24 @@
+:root {
+  color: #172033;
+  background: #ffffff;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+.shell {
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 4rem 1.5rem;
+}
+
+.eyebrow {
+  color: #3b5ccc;
+  font-weight: 600;
+}
+
+.intro {
+  line-height: 1.7;
+}

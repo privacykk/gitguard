@@ -1,0 +1,17 @@
+[package]
+name = "gitguard-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gitguard-core.workspace = true
+gitguard-policy.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[[bin]]
+name = "gitguard"
+path = "src/main.rs"

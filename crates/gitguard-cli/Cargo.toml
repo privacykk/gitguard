@@ -8,9 +8,14 @@ license.workspace = true
 [dependencies]
 gitguard-core.workspace = true
 gitguard-policy.workspace = true
+gitguard-config.workspace = true
+gitguard-ipc.workspace = true
+gitguard-git.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.14"
+serde_json = "1"
 
 [[bin]]
 name = "gitguard"

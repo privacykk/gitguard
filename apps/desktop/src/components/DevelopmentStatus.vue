@@ -21,7 +21,10 @@ onMounted(async () => {
 </script>
 
 <template>
-  <section aria-labelledby="status-title" class="status-card">
+  <section
+    aria-labelledby="status-title"
+    class="status-card"
+  >
     <h2 id="status-title">
       {{ t("development.title") }}
     </h2>

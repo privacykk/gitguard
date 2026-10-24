@@ -13,21 +13,29 @@
 ## 从零启动
 
 ```bash
+# 启用 Corepack，让 pnpm 按 package.json 固定为 9.2.0
 corepack enable
+# 严格按 pnpm-lock.yaml 安装前端依赖，锁文件与 package.json 不一致时直接报错（与 CI 一致）
 pnpm install --frozen-lockfile
+# 启动 Vite 开发服务器，固定 1420 端口（http://localhost:1420）
 pnpm dev
 ```
 
-在另一个终端启动 Tauri 桌面容器：
+启动 Tauri 桌面容器（会自动拉起上面的前端）：
 
 ```bash
+# Tauri 2 开发模式；beforeDevCommand 会执行 pnpm dev 并等待 1420 就绪
 pnpm tauri dev
 ```
 
 仅启动 Rust CLI：
 
 ```bash
+# 构建 CLI 二进制到 target/debug/gitguard
 cargo build -p gitguard-cli
+
+# 手工模拟 Hook stdin：每行四字段 <local ref> <local oid> <remote ref> <remote oid>
+# oid 须为 40 位（SHA-1）或 64 位（SHA-256）十六进制；删除分支时 local ref 为 (delete)、local oid 全 0
 ./target/debug/gitguard hook pre-push --policy allow <<'EOF'
 refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 EOF
@@ -38,12 +46,20 @@ EOF
 ## 检查与测试
 
 ```bash
+# 前端：ESLint，--max-warnings 0（warning 也判定为失败）
 pnpm lint
+# 前端：vue-tsc --noEmit 类型检查
 pnpm type-check
+# 前端：Vitest + jsdom 单元测试
 pnpm test:frontend
+# 前端：类型检查 + vite 生产构建
 pnpm build
+
+# Rust：格式检查（只检查，不修改文件）
 cargo fmt --all -- --check
+# Rust：lint，告警视为错误
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Rust：单元测试 + Unix 上的 Hook 集成测试
 cargo test --workspace
 ```
 
@@ -56,6 +72,15 @@ cargo test --workspace
 - 空输入、非法输入、非法 UTF-8 和 stdin 读取错误。
 
 测试不访问真实远端，不读取用户全局或系统 Git 配置，也不修改日常仓库。Windows 的 shell Hook 集成测试当前不会运行，已登记为跨平台后续工作；Rust 单元测试仍在各平台执行。
+
+## 界面语言
+
+桌面界面支持简体中文（`zh-CN`）与英文（`en-US`），使用 `vue-i18n` 实现：
+
+- 初始语言优先级：本地记忆（`localStorage` 键 `gitguard.locale`）→ 系统语言 → 简体中文；右上角下拉框可手动切换。
+- 文案集中在 `apps/desktop/src/i18n/messages`，新增语言需同时补齐对应语言包。
+- Tauri command 只返回稳定状态码（如 `week1_confirmation_unavailable`），展示文案由前端按当前语言渲染；未知状态码会显示 fail-closed 文案，不代表推送已被放行。
+- 语言切换只影响展示，不改变 CLI 退出码、`reason_code` 或任何放行决定。
 
 ## 参与开发
 
@@ -80,6 +105,7 @@ cargo test --workspace
 
 ```sh
 #!/bin/sh
+# "$@" 透传 Git 传入的 <remote-name> <remote-url>；CLI 只做参数校验，不会执行它们
 exec /absolute/path/to/gitguard hook pre-push --policy allow "$@"
 ```
 

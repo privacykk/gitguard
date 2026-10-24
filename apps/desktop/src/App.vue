@@ -1,15 +1,20 @@
 <script setup lang="ts">
+import { useI18n } from 'vue-i18n'
 import DevelopmentStatus from './components/DevelopmentStatus.vue'
+import LanguageSwitch from './components/LanguageSwitch.vue'
+
+const { t } = useI18n()
 </script>
 
 <template>
   <main class="shell">
+    <LanguageSwitch />
     <p class="eyebrow">
-      本地优先的 Git 推送保护
+      {{ t('app.eyebrow') }}
     </p>
-    <h1>GitGuard</h1>
+    <h1>{{ t('app.title') }}</h1>
     <p class="intro">
-      第一周工程原型：核心策略与 Hook 退出行为由 Rust 后端负责。
+      {{ t('app.intro') }}
     </p>
     <DevelopmentStatus />
   </main>

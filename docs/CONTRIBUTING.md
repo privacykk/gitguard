@@ -90,7 +90,11 @@ cargo build -p gitguard-cli
 - 使用 Composition API 与 `<script setup lang="ts">`。
 - `strict` 已开启：禁止 `any`，外部数据先按 `unknown` 建模再收窄；为业务数据定义类型。
 - 组件只承担展示与交互，不实现 Git 策略，也不决定是否放行。
-- 保留语义化标签与可访问性属性（如 `aria-labelledby`）；用户可见文案使用中文。
+- 保留语义化标签与可访问性属性（如 `aria-labelledby`）。
+- 用户可见文案统一放在 `src/i18n/messages/{zh-CN,en-US}.ts`，组件通过 `useI18n()` 获取，不硬编码字符串。
+- 新增语言或文案时同步补齐所有语言包；`en-US` 使用 `satisfies MessageSchema` 校验结构，缺少 key 会在 `pnpm type-check` 阶段失败。
+- Tauri command 返回稳定状态码而非面向用户的句子；状态码到文案的映射、白名单校验与未知值降级放在 `src/i18n` 内。
+- 前端语言切换只影响展示，不参与策略判断，也不构成安全控制。
 - 样式使用 `scoped`；新增 UI 库、状态库或路由前先更新技术栈说明。
 - `pnpm lint`、`pnpm type-check`、`pnpm build` 必须无告警通过。
 

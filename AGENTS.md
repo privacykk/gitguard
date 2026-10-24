@@ -35,7 +35,7 @@ GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScrip
 | `crates/gitguard-core`     | `Decision`、`PolicyResult`、`RefUpdate`、`GitGuardError`、`CliExitCode`         |
 | `crates/gitguard-policy`   | 原型策略 `evaluate` 与 `PrototypePolicy`，纯逻辑                                |
 | `crates/gitguard-cli`      | 参数校验、完整读取 stdin、逐行解析 ref、调用策略、退出码映射（bin：`gitguard`） |
-| `apps/desktop/src`         | Vue 界面，只展示状态，不做策略判断                                              |
+| `apps/desktop/src`         | Vue 界面、i18n 语言包与状态码映射，只展示状态，不做策略判断                     |
 | `apps/desktop/src-tauri`   | Tauri 入口与 commands，不实现策略                                               |
 | `docs/`                    | 架构、安全、Week 1 计划、MVP 路线图                                             |
 | `.github/workflows/ci.yml` | 唯一 CI 流水线                                                                  |
@@ -88,7 +88,9 @@ Git pre-push Hook → gitguard-cli → gitguard-policy → gitguard-core
 
 - 使用 Composition API 与 `<script setup lang="ts">`；`tsconfig` 已开启 `strict`，禁止 `any`（必要时用 `unknown` 收窄）。
 - 组件只负责展示与交互；业务类型与决策逻辑放在 Rust，经 Tauri command 暴露。
-- 保留现有可访问性写法（语义标签、`aria-labelledby` 等），文案使用中文。
+- 保留现有可访问性写法（语义标签、`aria-labelledby` 等）。
+- 用户可见文案统一放在 `apps/desktop/src/i18n/messages`，组件通过 `useI18n()` 获取，不硬编码字符串。
+- 新增或修改文案时同步补齐 `zh-CN` 与 `en-US`；`en-US` 使用 `satisfies MessageSchema` 保证结构一致。Tauri command 只返回稳定状态码，不返回面向用户的句子。
 - 组件样式使用 `scoped`；不要引入未声明的 UI 框架或状态库。
 
 ### 格式与文件

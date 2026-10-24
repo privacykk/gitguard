@@ -29,11 +29,22 @@ const selectedLocale = computed({
 
 <template>
   <div class="language-switch">
-    <label class="language-switch__label" for="locale-select">
+    <label
+      class="language-switch__label"
+      for="locale-select"
+    >
       {{ t("language.label") }}
     </label>
-    <select id="locale-select" v-model="selectedLocale" class="language-switch__select">
-      <option v-for="option in SUPPORTED_LOCALES" :key="option" :value="option">
+    <select
+      id="locale-select"
+      v-model="selectedLocale"
+      class="language-switch__select"
+    >
+      <option
+        v-for="option in SUPPORTED_LOCALES"
+        :key="option"
+        :value="option"
+      >
         {{ LOCALE_LABELS[option] }}
       </option>
     </select>

@@ -1,0 +1,350 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+
+/**
+ * 与 Rust 后端之间的数据契约。
+ *
+ * 后端返回的都是稳定状态码与纯数据，前端负责把状态码翻译成当前语言的文案；
+ * 这里对 command 的返回值做形状校验：形状不对时按「没有待确认请求」处理，
+ * 绝不猜测出一个可确认的请求。
+ */
+
+/** 单条提交的展示数据。 */
+export interface CommitInfo {
+  sha: string;
+  shortSha: string;
+  author: string;
+  timestamp: string;
+  subject: string;
+}
+
+/** ref 更新的类型，决定界面上的风险提示。 */
+export type RefKind = "create" | "update" | "delete";
+
+/** 单个 ref 的待推送内容。 */
+export interface RefPreview {
+  localRef: string;
+  remoteRef: string;
+  kind: RefKind;
+  commits: CommitInfo[];
+}
+
+/** 待用户确认的推送请求。 */
+export interface PushConfirmation {
+  requestId: string;
+  repositoryPath: string;
+  remoteName: string;
+  remoteUrl: string;
+  refs: RefPreview[];
+  timeoutSeconds: number;
+  receivedAtEpochSecs: number;
+}
+
+/** 全局设置。 */
+export interface GlobalSettings {
+  defaultPushConfirmation: boolean;
+  confirmationTimeoutSeconds: number;
+}
+
+/** 单个仓库的设置；`hookStatus` 是稳定状态码，由前端翻译。 */
+export interface RepositorySettings {
+  repositoryId: string;
+  canonicalPath: string;
+  pushConfirmationEnabled: boolean;
+  hookStatus: string;
+}
+
+/** 设置页需要的全部数据。 */
+export interface Settings {
+  global: GlobalSettings;
+  repositories: RepositorySettings[];
+  configError: string | null;
+  ipcError: string | null;
+}
+
+/** command 失败时返回的稳定错误码。 */
+export class GitGuardCommandError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = "GitGuardCommandError";
+  }
+}
+
+const REF_KINDS: readonly RefKind[] = ["create", "update", "delete"];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseRefKind(value: unknown): RefKind | null {
+  return REF_KINDS.find((kind) => kind === value) ?? null;
+}
+
+function parseCommitInfo(value: unknown): CommitInfo | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const { sha, shortSha, author, timestamp, subject } = value;
+  if (
+    typeof sha !== "string" ||
+    typeof shortSha !== "string" ||
+    typeof author !== "string" ||
+    typeof timestamp !== "string" ||
+    typeof subject !== "string"
+  ) {
+    return null;
+  }
+  return { sha, shortSha, author, timestamp, subject };
+}
+
+function parseRefPreview(value: unknown): RefPreview | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const kind = parseRefKind(value.kind);
+  if (
+    kind === null ||
+    typeof value.localRef !== "string" ||
+    typeof value.remoteRef !== "string" ||
+    !Array.isArray(value.commits)
+  ) {
+    return null;
+  }
+
+  const commits: CommitInfo[] = [];
+  for (const entry of value.commits) {
+    const commit = parseCommitInfo(entry);
+    if (commit === null) {
+      return null;
+    }
+    commits.push(commit);
+  }
+
+  return {
+    localRef: value.localRef,
+    remoteRef: value.remoteRef,
+    kind,
+    commits,
+  };
+}
+
+/** 把 command 返回值收窄为待确认请求；形状不完整时返回 null。 */
+export function parsePushConfirmation(value: unknown): PushConfirmation | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const {
+    requestId,
+    repositoryPath,
+    remoteName,
+    remoteUrl,
+    refs,
+    timeoutSeconds,
+    receivedAtEpochSecs,
+  } = value;
+
+  if (
+    typeof requestId !== "string" ||
+    typeof repositoryPath !== "string" ||
+    typeof remoteName !== "string" ||
+    typeof remoteUrl !== "string" ||
+    typeof timeoutSeconds !== "number" ||
+    typeof receivedAtEpochSecs !== "number" ||
+    !Array.isArray(refs)
+  ) {
+    return null;
+  }
+
+  const parsedRefs: RefPreview[] = [];
+  for (const entry of refs) {
+    const ref = parseRefPreview(entry);
+    if (ref === null) {
+      return null;
+    }
+    parsedRefs.push(ref);
+  }
+
+  return {
+    requestId,
+    repositoryPath,
+    remoteName,
+    remoteUrl,
+    refs: parsedRefs,
+    timeoutSeconds,
+    receivedAtEpochSecs,
+  };
+}
+
+function parseSettings(value: unknown): Settings | null {
+  if (!isRecord(value) || !isRecord(value.global)) {
+    return null;
+  }
+
+  const { defaultPushConfirmation, confirmationTimeoutSeconds } = value.global;
+  if (
+    typeof defaultPushConfirmation !== "boolean" ||
+    typeof confirmationTimeoutSeconds !== "number" ||
+    !Array.isArray(value.repositories)
+  ) {
+    return null;
+  }
+
+  const repositories: RepositorySettings[] = [];
+  for (const entry of value.repositories) {
+    if (!isRecord(entry)) {
+      return null;
+    }
+    const { repositoryId, canonicalPath, pushConfirmationEnabled, hookStatus } =
+      entry;
+    if (
+      typeof repositoryId !== "string" ||
+      typeof canonicalPath !== "string" ||
+      typeof pushConfirmationEnabled !== "boolean" ||
+      typeof hookStatus !== "string"
+    ) {
+      return null;
+    }
+    repositories.push({
+      repositoryId,
+      canonicalPath,
+      pushConfirmationEnabled,
+      hookStatus,
+    });
+  }
+
+  return {
+    global: { defaultPushConfirmation, confirmationTimeoutSeconds },
+    repositories,
+    configError:
+      typeof value.configError === "string" ? value.configError : null,
+    ipcError: typeof value.ipcError === "string" ? value.ipcError : null,
+  };
+}
+
+function toCommandError(reason: unknown): GitGuardCommandError {
+  if (reason instanceof GitGuardCommandError) {
+    return reason;
+  }
+  if (isRecord(reason) && typeof reason.code === "string") {
+    return new GitGuardCommandError(reason.code);
+  }
+  return new GitGuardCommandError("unknown");
+}
+
+/** 当前是否运行在 Tauri 容器内；浏览器里直接打开 Vite 时为 false。 */
+export function isDesktopAvailable(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    "__TAURI_INTERNALS__" in (window as unknown as Record<string, unknown>)
+  );
+}
+
+/** 读取当前待确认的推送请求；没有或形状不对时返回 null。 */
+export async function getPendingPush(): Promise<PushConfirmation | null> {
+  const value = await invoke<unknown>("get_pending_push_request");
+  return parsePushConfirmation(value);
+}
+
+/**
+ * 用户确认推送；失败时抛 {@link GitGuardCommandError}。
+ *
+ * 桌面端只把「已确认」回给 CLI，真正的推送由原始 `git push` 进程继续执行，
+ * 所以这里没有推送结果可展示，成功时只返回 void。
+ */
+export async function confirmPush(requestId: string): Promise<void> {
+  try {
+    await invoke("confirm_push", { requestId });
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/** 用户取消推送。 */
+export async function cancelPush(requestId: string): Promise<void> {
+  try {
+    await invoke("cancel_push", { requestId });
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/** 读取设置页数据。 */
+export async function getSettings(): Promise<Settings> {
+  const value = await invoke<unknown>("get_settings");
+  const settings = parseSettings(value);
+  if (settings === null) {
+    throw new GitGuardCommandError("internal_error");
+  }
+  return settings;
+}
+
+/** 添加仓库并安装 Hook；`enabled` 是该仓库的推送保护开关初始值。 */
+export async function addRepository(
+  path: string,
+  enabled: boolean,
+): Promise<void> {
+  try {
+    await invoke("add_repository", { path, enabled });
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/**
+ * 打开系统文件夹选择器并返回用户选中的目录。
+ *
+ * 取消选择（返回 null）或返回非字符串时一律当作「没有选择」，
+ * 不使用上一次的输入顶替，也不猜测路径。
+ */
+export async function pickRepositoryDirectory(): Promise<string | null> {
+  const selected = await open({ directory: true, multiple: false });
+  return typeof selected === "string" ? selected : null;
+}
+
+/** 切换仓库的推送保护开关。 */
+export async function toggleProtection(
+  repositoryId: string,
+  enabled: boolean,
+): Promise<void> {
+  try {
+    await invoke("toggle_repo_protection", { repositoryId, enabled });
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/** 修改新仓库的默认推送保护开关。 */
+export async function setDefaultProtection(enabled: boolean): Promise<void> {
+  try {
+    await invoke("set_default_protection", { enabled });
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/** 设置确认超时时间（秒）。 */
+export async function setConfirmationTimeout(seconds: number): Promise<void> {
+  try {
+    await invoke("set_confirmation_timeout", { seconds });
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/**
+ * 监听新的待确认请求事件。
+ *
+ * 返回取消监听的函数；事件负载形状不对时忽略该事件（不用它驱动确认界面）。
+ */
+export async function listenPushRequests(
+  handler: (confirmation: PushConfirmation) => void,
+): Promise<() => void> {
+  const unlisten = await listen<unknown>("push-request-received", (event) => {
+    const confirmation = parsePushConfirmation(event.payload);
+    if (confirmation !== null) {
+      handler(confirmation);
+    }
+  });
+  return unlisten;
+}

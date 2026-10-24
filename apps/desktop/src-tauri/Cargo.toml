@@ -14,4 +14,16 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 gitguard-core.workspace = true
+gitguard-config.workspace = true
+gitguard-ipc.workspace = true
+gitguard-git.workspace = true
+gitguard-hook.workspace = true
+serde.workspace = true
 tauri = { version = "2", features = [] }
+# 文件夹选择对话框：让用户挑选仓库目录，避免手写相对路径。
+tauri-plugin-dialog = "2"
+
+[dev-dependencies]
+tempfile = "3"
+# 仅测试用：断言 Tauri command 返回的 JSON 字段名与前端结构校验契约一致。
+serde_json.workspace = true

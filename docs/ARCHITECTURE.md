@@ -55,4 +55,4 @@ gitguard-policy → gitguard-core
 
 ## 测试边界
 
-策略与解析由单元测试覆盖。Unix 下，Rust 集成测试通过参数数组启动 Git，在临时工作仓库和 bare remote 间进行真实 push，并比较远端 refs。CI 在构建前端后执行完整 workspace 检查，确保 Tauri `frontendDist` 可用。
+策略与解析由单元测试覆盖。Unix 下，Rust 集成测试通过参数数组启动 Git，在临时工作仓库和 bare remote 间进行真实 push，并比较远端 refs。CI（Actions 页面手动触发）在构建前端后执行完整 workspace 检查，确保 Tauri `frontendDist` 可用。

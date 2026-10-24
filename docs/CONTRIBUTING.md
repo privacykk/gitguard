@@ -51,7 +51,7 @@ cargo build -p gitguard-cli
 ## 4. 分支、提交与评审
 
 - `main` 始终保持可构建、可验证；改动通过分支与 Pull Request 合入。
-- CI（`.github/workflows/ci.yml`）必须通过，不得通过删除步骤、放宽参数或跳过测试来绕过。
+- CI（`.github/workflows/ci.yml`）仅在 Actions 页面手动触发（`workflow_dispatch`），合入前应有手动运行通过的结果；不得通过删除步骤、放宽参数或跳过测试来绕过。
 - 提交信息采用 Conventional Commits：
 
 | 前缀           | 用途             |
@@ -171,7 +171,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-全部通过后再提交。CI 在 `ubuntu-latest` 上执行同一组检查，并额外安装 Linux Tauri 依赖。
+全部通过后再提交。CI 不会在 push 或 Pull Request 时自动运行，需在 Actions 页面手动触发 `workflow_dispatch`；它在 `ubuntu-latest` 上执行同一组检查，并额外安装 Linux Tauri 依赖。
 
 ## 10. 优先级
 

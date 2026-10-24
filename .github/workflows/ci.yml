@@ -1,9 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  # 仅支持在 Actions 页面手动触发；push 与 pull_request 不再自动运行。
+  workflow_dispatch:
 
 permissions:
   contents: read

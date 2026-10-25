@@ -1,7 +1,7 @@
 # GitGuard 开发规范
 
 > 适用于日常开发与代码评审。模块边界与依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)，安全边界见 [SECURITY.md](SECURITY.md)，AI 代理的执行约定见 [../AGENTS.md](../AGENTS.md)。
-> Week 1 的原始周计划保留在 [develop/WEEK-1.md](develop/WEEK-1.md)，属于历史文档；本文件是长期有效的工程规范。
+> 阶段目标与里程碑见 [develop/GitGuard-MVP-路线图.md](develop/GitGuard-MVP-路线图.md)，桌面端页面结构见 [develop/GitGuard-桌面端-信息架构与交互设计.md](develop/GitGuard-桌面端-信息架构与交互设计.md)；本文件是长期有效的工程规范。
 
 ## 1. 阶段与范围
 
@@ -45,7 +45,7 @@ git rev-parse --git-path hooks/pre-push   # 先确认目标路径
 cargo build -p gitguard-cli
 ```
 
-- 真实模式（`gitguard hook pre-push <remote-name> <remote-url>`）读配置后自动选择确认通道：有控制终端时在终端确认，否则走 IPC 请求桌面端；`--policy` 调试模式不读配置也不发 IPC。
+- 真实模式（`gitguard hook pre-push --repository-id <uuid> <remote-name> <remote-url>`）读配置后自动选择确认通道：有控制终端时在终端确认，否则走 IPC 请求桌面端；`--policy` 调试模式不读配置也不发 IPC。`--repository-id` 由桌面端安装 Hook 时写入，必须是 UUID；带 id 但配置里找不到同 id 记录时按「记录丢失」处理，仍要求确认。
 - 桌面端「添加仓库」会安装 Hook；已存在的用户 Hook 会先备份为 `pre-push.gitguard-backup` 并链式调用，不得改成直接覆盖。
 - 不要在个人日常仓库反复试验；调试确认流程时用临时仓库，避免误触真实远端。
 
@@ -98,16 +98,25 @@ cargo build -p gitguard-cli
 - Tauri command 返回稳定错误码或枚举值而非面向用户的句子；白名单校验、未知值降级与状态码到文案的映射放在 `src/statusCodes.ts`，command 返回值的形状校验放在 `src/api.ts`。
 - 形状不完整或无法识别的返回值必须降级为「没有待确认请求」或 fail-closed 文案，不得凭空构造可确认的界面。
 - 前端语言切换只影响展示，不参与策略判断，也不构成安全控制。
-- 样式使用 `scoped`；新增 UI 库、状态库或路由前先更新技术栈说明。
+- UI 使用 Element Plus 2 + Tailwind CSS 4：展示结构放进 `src/components/ui`（页头、卡片、栅格、状态标签等）复用，组件样式默认用 Tailwind 原子类，只在覆盖 Element Plus 内部结构时用 `scoped` + `:deep()`。新增 UI 库、状态库或路由前先更新技术栈说明。
+- Element Plus 按需注册：模板新增 `el-*` 组件时同步改 `src/elementPlus.ts` 与 `src/style.css` 里的 `theme-chalk/el-*.css`，`src/elementPlus.test.ts` 会拦住漏注册。
+- 颜色、字号、圆角、阴影只用令牌：文字用 `text-ink` / `text-ink-muted`，字号用 `text-meta`（13px）/ `text-caption`（12px）/ `text-micro`（11px）/ `text-title`（15px）或 Tailwind 自带档位，不要写 `text-[0.8125rem]` 这类魔法值；新档位先加到 `src/style.css` 的 `@theme`。
 - `pnpm lint`、`pnpm type-check`、`pnpm build` 必须无告警通过。
 
-### 5.3 格式与文件
+### 5.3 编辑器诊断与格式
+
+- 提交前，你改动过的文件在编辑器里必须没有报错或警告：ESLint、`vue-tsc`、Tailwind 建议项、`rust-analyzer` 都要清零。命令跑绿不等于完成，还要看 Problems 面板。
+- 不允许用 `any`、`@ts-ignore`、`@ts-expect-error`、`eslint-disable`、`#[allow(...)]` 压掉诊断；确有第三方类型缺陷时，把范围收到最小并写明原因。
+- 编辑器报错与 `pnpm type-check` 结论相反时，先排查语言服务再改代码。Vetur 与 Volar 同时启用会对 `import Foo from "./Foo.vue"` 报 `has no default export`，本仓库已在 `.vscode/settings.json` 关闭 Vetur 校验；不要为此改组件导出方式。
+- `src/shims-vue.d.ts` 是不识别 `.vue` 的语言服务的兜底声明，不要删除，也不要在其中写 `any`；新的全局声明放进同目录 `*.d.ts` 并确保被 `tsconfig.json` 的 `include` 覆盖。
+
+### 5.4 格式与文件
 
 - 遵循 `.editorconfig`：UTF-8、LF、行尾无空白、文件末尾换行；`*.rs`、`*.toml` 使用 4 空格，其余默认 2 空格。
 - 不整体重排无关文件；不改动与任务无关的缩进、引号或分号风格。
 - 不提交构建产物与本地状态：`target/`、`node_modules/`、`dist/`、`src-tauri/gen/schemas/` 已在 `.gitignore` 中。
 
-### 5.4 文档
+### 5.5 文档
 
 - 文档使用中文，命令、路径、标识符保持英文原名，不创造新的中英混写术语。
 - 每份文档职责单一：`ARCHITECTURE.md` 讲边界与流程，`SECURITY.md` 讲保证与限制，本文件讲工程规范。

@@ -7,6 +7,8 @@
 //! - `gitguard hook pre-push <remote-name> <remote-url>`：真实 Hook 模式。
 //!   有控制终端（在终端里执行 `git push`）时直接在终端确认；没有控制终端
 //!   （SourceTree、VS Code、CI 等）时通过 IPC 请求桌面端确认。
+//!   桌面端写出的 Hook 还会额外传 `--repository-id <uuid>`，用于把 Hook 与配置里
+//!   的登记记录对应起来；配置记录丢失时据此拒绝静默放行。
 //! - `gitguard hook pre-push --policy <allow|deny|confirm|unavailable>`：Week 1 的
 //!   原型调试模式，不读配置、不发 IPC，仅用于测试与排查。
 //!
@@ -20,10 +22,12 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gitguard_config::PushConfirmationState;
 use gitguard_core::{
     CliExitCode, ConfirmationDecision, Decision, GitGuardError, PushConfirmationRequest, RefUpdate,
 };
 use gitguard_policy::{evaluate, PrototypePolicy};
+use uuid::Uuid;
 
 /// 确认超时至少留 1 秒：配置里写 0 时仍给桌面端一个响应机会，
 /// 超时只会导致 fail-closed，但把 0 直接交给 socket API 会变成参数错误。
@@ -129,9 +133,21 @@ fn request_confirmation<W: Write>(
     let repo_key = path_to_key(&repo_path)?;
 
     let config = gitguard_config::load_config()?;
-    // 用户显式关掉保护的仓库直接放行；未登记的仓库走全局默认（默认开启）。
-    if !gitguard_config::is_push_confirmation_enabled(&config, repo_key) {
-        return Ok(Outcome::Allow);
+    // 判定顺序见 `gitguard_config::push_confirmation_state`：用户显式关掉保护才直接放行；
+    // Hook 带着仓库 id 但配置里找不到记录时，按「记录丢失」处理，仍然要求确认。
+    match gitguard_config::push_confirmation_state(&config, repo_key, args.repository_id.as_deref())
+    {
+        PushConfirmationState::Disabled => return Ok(Outcome::Allow),
+        PushConfirmationState::Required => {}
+        PushConfirmationState::RecordMissing => {
+            // 无法判断用户原本的开关，所以不静默放行；提示里不拼仓库路径，避免输出未过滤的输入。
+            let _ = writeln!(
+                stderr,
+                "gitguard: no GitGuard record matches this repository's hook (the config was removed \
+                 or the directory moved); confirmation is still required, re-add the repository in \
+                 the desktop app to restore its setting"
+            );
+        }
     }
 
     let timeout = Duration::from_secs(
@@ -283,6 +299,8 @@ fn now_epoch_secs() -> u64 {
 struct HookArgs {
     /// `Some` 表示 Week 1 原型调试模式（不走配置与 IPC）。
     policy: Option<PrototypePolicy>,
+    /// Hook 脚本写入的仓库 id；旧版脚本没有这个参数。
+    repository_id: Option<String>,
     /// Git 传入的 remote 名称；原型模式下可以不传。
     remote_name: Option<String>,
     /// Git 传入的 remote URL；只用于展示。
@@ -292,7 +310,7 @@ struct HookArgs {
 /// 校验并解析命令行参数。
 ///
 /// - `args` 包含程序名本身（argv[0]），所以先 `skip(1)`；
-/// - 固定前缀是 `hook pre-push`，其后可选 `--policy <值>`；
+/// - 固定前缀是 `hook pre-push`，其后可选 `--policy <值>` 与 `--repository-id <uuid>`；
 /// - Git 调用 Hook 时会额外追加 `<remote-name> <remote-url>`，这里只接受
 ///   「两个都有或都没有」，且只做校验，不会执行 URL 里的内容；
 /// - 真实模式（不带 `--policy`）必须拿到 Git 传入的 remote 信息，
@@ -302,25 +320,49 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    const USAGE: &str = "usage: gitguard hook pre-push [--policy <allow|deny|confirm|unavailable>] [remote-name remote-url]";
+    const USAGE: &str = "usage: gitguard hook pre-push [--policy <allow|deny|confirm|unavailable>] [--repository-id <uuid>] [remote-name remote-url]";
 
     let args: Vec<String> = args.into_iter().map(Into::into).skip(1).collect();
     if args.len() < 2 || args[0] != "hook" || args[1] != "pre-push" {
         return Err(GitGuardError::InvalidInput(USAGE.into()));
     }
 
-    let mut rest = &args[2..];
+    let mut index = 2;
     let mut policy = None;
-    if rest.first().map(String::as_str) == Some("--policy") {
-        let Some(value) = rest.get(1) else {
-            return Err(GitGuardError::InvalidInput(USAGE.into()));
-        };
-        policy = Some(value.parse()?);
-        rest = &rest[2..];
+    let mut repository_id = None;
+    while let Some(flag) = args.get(index).map(String::as_str) {
+        match flag {
+            "--policy" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(GitGuardError::InvalidInput(USAGE.into()));
+                };
+                if policy.is_some() {
+                    return Err(GitGuardError::InvalidInput(USAGE.into()));
+                }
+                policy = Some(value.parse()?);
+            }
+            "--repository-id" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(GitGuardError::InvalidInput(USAGE.into()));
+                };
+                if repository_id.is_some() {
+                    return Err(GitGuardError::InvalidInput(USAGE.into()));
+                }
+                // 这个值来自仓库里的 Hook 脚本：形状不合法就不接受，避免拿它去匹配配置。
+                if Uuid::parse_str(value).is_err() {
+                    return Err(GitGuardError::InvalidInput(
+                        "--repository-id must be a UUID".into(),
+                    ));
+                }
+                repository_id = Some(value.clone());
+            }
+            _ => break,
+        }
+        index += 2;
     }
 
-    // 第 3 个参数起是 Git 传入的 remote 名与 URL：要么不传，要么恰好两个。
-    let (remote_name, remote_url) = match rest {
+    // 剩下的参数是 Git 传入的 remote 名与 URL：要么不传，要么恰好两个。
+    let (remote_name, remote_url) = match &args[index..] {
         [] => (None, None),
         [name, url] => (Some(name.clone()), Some(url.clone())),
         _ => {
@@ -338,6 +380,7 @@ where
 
     Ok(HookArgs {
         policy,
+        repository_id,
         remote_name,
         remote_url,
     })
@@ -566,11 +609,67 @@ mod tests {
         .expect("real mode arguments should parse");
 
         assert!(parsed.policy.is_none(), "真实模式不得隐含任何原型策略");
+        assert_eq!(parsed.repository_id, None, "旧版脚本不带仓库 id");
         assert_eq!(parsed.remote_name.as_deref(), Some("origin"));
         assert_eq!(
             parsed.remote_url.as_deref(),
             Some("git@example.com:team/project.git")
         );
+    }
+
+    #[test]
+    fn parses_the_repository_id_written_into_the_hook() {
+        let parsed = parse_args([
+            "gitguard",
+            "hook",
+            "pre-push",
+            "--repository-id",
+            "00000000-0000-4000-8000-000000000000",
+            "origin",
+            "git@example.com:team/project.git",
+        ])
+        .expect("hook arguments with a repository id should parse");
+
+        assert_eq!(
+            parsed.repository_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000000")
+        );
+        assert_eq!(parsed.remote_name.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn rejects_a_repository_id_that_is_not_a_uuid() {
+        // 这个值会被拿去匹配配置记录，形状不合法就宁可直接拒绝，也不要猜。
+        for arguments in [
+            vec!["gitguard", "hook", "pre-push", "--repository-id"],
+            vec![
+                "gitguard",
+                "hook",
+                "pre-push",
+                "--repository-id",
+                "not-a-uuid",
+                "origin",
+                "file:///tmp/remote.git",
+            ],
+            vec![
+                "gitguard",
+                "hook",
+                "pre-push",
+                "--repository-id",
+                "00000000-0000-4000-8000-000000000000",
+                "--repository-id",
+                "00000000-0000-4000-8000-000000000001",
+                "origin",
+                "file:///tmp/remote.git",
+            ],
+        ] {
+            let code = run(
+                arguments,
+                &mut Cursor::new(ordinary_update()),
+                &mut Vec::new(),
+            );
+            assert_eq!(code, CliExitCode::InvalidInput.as_i32());
+        }
     }
 
     #[test]

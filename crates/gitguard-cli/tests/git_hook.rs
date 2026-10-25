@@ -14,6 +14,11 @@ use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
+/// 测试配置里固定的仓库 id。
+///
+/// 桌面端写出的 Hook 会把自己的仓库 id 传给 CLI，CLI 靠它把 Hook 与配置记录对上。
+const REGISTERED_REPOSITORY_ID: &str = "00000000-0000-4000-8000-000000000000";
+
 /// 一套隔离的 Git 测试环境：临时目录持有者 + 工作仓库 + 本地 bare remote。
 ///
 /// `_temp` 只用于保持临时目录存活；字段名前缀下划线表示「不直接读取」。
@@ -124,6 +129,11 @@ impl GitFixture {
 
     /// 在隔离的 HOME 下写入 GitGuard 配置，决定这个仓库是否启用推送确认。
     fn write_config(&self, home: &Path, enabled: bool) {
+        self.write_config_with_id(home, REGISTERED_REPOSITORY_ID, enabled);
+    }
+
+    /// 同 [`Self::write_config`]，但允许指定登记记录里的仓库 id。
+    fn write_config_with_id(&self, home: &Path, repository_id: &str, enabled: bool) {
         let canonical = self
             .work
             .canonicalize()
@@ -140,11 +150,11 @@ impl GitFixture {
         let config = serde_json::json!({
             "schema_version": 1,
             "global": {
-                "default_push_confirmation": true,
+                "require_confirmation_for_unregistered_repositories": true,
                 "confirmation_timeout_seconds": 180
             },
             "repositories": [{
-                "repository_id": "00000000-0000-4000-8000-000000000000",
+                "repository_id": repository_id,
                 "canonical_path": canonical.to_str().expect("UTF-8 canonical path"),
                 "push_confirmation_enabled": enabled,
                 "hook_status": "Unknown"
@@ -158,7 +168,22 @@ impl GitFixture {
     }
 
     /// 安装不带 `--policy` 的真实模式 Hook（Git 会额外追加 remote 参数）。
+    ///
+    /// 与桌面端写出的脚本一致：带上仓库 id，CLI 因此能判断这条 Hook 属于哪次登记。
     fn install_real_hook(&self) {
+        self.install_real_hook_with_id(REGISTERED_REPOSITORY_ID);
+    }
+
+    /// 同 [`Self::install_real_hook`]，但指定脚本携带的仓库 id。
+    fn install_real_hook_with_id(&self, repository_id: &str) {
+        let binary = shell_quote(Path::new(env!("CARGO_BIN_EXE_gitguard")));
+        self.install_hook(&format!(
+            "#!/bin/sh\nexec {binary} hook pre-push --repository-id {repository_id} \"$@\"\n"
+        ));
+    }
+
+    /// 安装升级前写出的旧版 Hook：不带仓库 id，只能按路径匹配配置。
+    fn install_legacy_real_hook(&self) {
         let binary = shell_quote(Path::new(env!("CARGO_BIN_EXE_gitguard")));
         self.install_hook(&format!("#!/bin/sh\nexec {binary} hook pre-push \"$@\"\n"));
     }
@@ -353,6 +378,8 @@ fn real_mode_exits_with_ipc_error_when_no_desktop_app_is_running() {
     // 配置要求确认，但隔离的 HOME 里没有 socket：必须以 IPC 错误（7）退出。
     let fixture = GitFixture::new();
     let home = fixture.isolated_home();
+    // 保护是逐仓库显式开启的；这里显式写入一条启用保护的记录。
+    fixture.write_config(&home, true);
     let local = git(&fixture.work, &["rev-parse", "HEAD"]).stdout;
     let local = String::from_utf8(local)
         .expect("UTF-8 oid")
@@ -401,6 +428,78 @@ fn real_mode_blocks_push_when_the_desktop_app_is_not_running() {
         .status
         .success(),
         "被拒绝的 push 不得在远端留下 ref"
+    );
+}
+
+#[test]
+fn real_mode_blocks_push_when_the_hook_record_is_missing() {
+    // 回归：配置文件被删除或回滚后，仓库里的 Hook 仍在。脚本带着仓库 id，
+    // 但配置里找不到对应记录 —— 无法判断用户原本的开关，所以必须拒绝静默放行：
+    // 没有确认服务时 push 直接失败，远端不会留下 ref。
+    let fixture = GitFixture::new();
+    let home = fixture.isolated_home();
+    fixture.install_real_hook();
+
+    let output = fixture.push_with_home(&home, &["push", "origin", "main"]);
+    assert!(
+        !output.status.success(),
+        "记录丢失时不得静默放行: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !try_git(
+            &fixture.remote,
+            &["show-ref", "--verify", "refs/heads/main"]
+        )
+        .status
+        .success(),
+        "被拒绝的 push 不得在远端留下 ref"
+    );
+}
+
+#[test]
+fn real_mode_blocks_push_when_the_hook_id_does_not_match_the_record() {
+    // 记录还在、但 id 对不上（配置回滚、仓库被复制）：同样按记录丢失处理，
+    // 不能因为「路径还在配置里」就沿用那条记录的开关。
+    let fixture = GitFixture::new();
+    let home = fixture.isolated_home();
+    fixture.write_config(&home, false);
+    fixture.install_real_hook_with_id("11111111-1111-4111-8111-111111111111");
+
+    let output = fixture.push_with_home(&home, &["push", "origin", "main"]);
+    assert!(
+        !output.status.success(),
+        "id 不匹配时不得静默放行: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !try_git(
+            &fixture.remote,
+            &["show-ref", "--verify", "refs/heads/main"]
+        )
+        .status
+        .success(),
+        "被拒绝的 push 不得在远端留下 ref"
+    );
+}
+
+#[test]
+fn real_mode_allows_a_legacy_hook_without_a_record_to_fall_back_to_the_global_default() {
+    // 已知残余路径：升级前写出的脚本不带仓库 id，又恰好丢了配置记录时，
+    // 只能回落到全局开关（默认关闭），这是 docs/SECURITY.md 记录的削弱点。
+    let fixture = GitFixture::new();
+    let home = fixture.isolated_home();
+    fixture.install_legacy_real_hook();
+
+    let output = fixture.push_with_home(&home, &["push", "origin", "main"]);
+    assert!(
+        output.status.success(),
+        "旧版脚本只能回落到全局默认: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.remote_oid("refs/heads/main"),
+        git(&fixture.work, &["rev-parse", "refs/heads/main"]).stdout
     );
 }
 

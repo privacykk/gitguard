@@ -28,6 +28,12 @@ const BACKUP_SUFFIX: &str = ".gitguard-backup";
 /// 写入脚本第二行的标识。健康检查靠它判断「这个 Hook 由 GitGuard 管理」。
 const HOOK_MARKER: &str = "# GitGuard pre-push hook - do not edit manually";
 
+/// 脚本传给 CLI 的仓库 id 参数。
+///
+/// CLI 靠它把「当前仓库的 Hook」与「配置里的登记记录」对应起来：即使仓库目录被
+/// 移动、配置文件被误删，也能看出这条 Hook 原本属于哪次登记，从而拒绝静默放行。
+const REPOSITORY_ID_ARG: &str = "--repository-id";
+
 /// 与某个仓库相关的三个路径，避免调用方自己拼文件名。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookPaths {
@@ -53,15 +59,20 @@ pub fn hook_paths(repo_path: &Path) -> Result<HookPaths> {
 
 /// 安装 GitGuard 的 `pre-push` Hook。
 ///
+/// `repository_id` 是这条仓库记录在配置里的 id，会写进脚本传给 CLI，
+/// 让 CLI 在「配置记录丢失」时仍能判断出这是一条已登记的 Hook。
+///
 /// 行为：
 /// - Hook 不存在：直接写入 GitGuard 脚本；
-/// - Hook 已是 GitGuard 管理：按当前二进制路径重写，不会重复备份；
+/// - Hook 已是 GitGuard 管理：按当前二进制路径与 id 重写，不会重复备份；
 /// - Hook 是用户的其它脚本：先备份为 `pre-push.gitguard-backup`，再写入链式调用脚本；
 /// - Hook 是别人的脚本、但备份已存在：说明有人绕过 GitGuard 改了 Hook，
 ///   此时拒绝继续，避免把用户原有的 Hook 覆盖掉。
 ///
 /// 写入采用「同目录临时文件 + rename」，避免中途失败留下半截脚本。
-pub fn install_hook(repo_path: &Path, gitguard_binary: &Path) -> Result<()> {
+pub fn install_hook(repo_path: &Path, gitguard_binary: &Path, repository_id: &str) -> Result<()> {
+    validate_repository_id(repository_id)?;
+
     let binary = shell_quote(gitguard_binary)?;
     let paths = hook_paths(repo_path)?;
 
@@ -78,7 +89,11 @@ pub fn install_hook(repo_path: &Path, gitguard_binary: &Path) -> Result<()> {
     let script = match existing {
         Some(content) if is_gitguard_hook(&content) => {
             // 已由 GitGuard 管理：沿用是否备份过的事实，只刷新脚本内容。
-            build_script(&binary, backup_exists.then_some(&paths.backup))?
+            build_script(
+                &binary,
+                repository_id,
+                backup_exists.then_some(&paths.backup),
+            )?
         }
         Some(_) => {
             if backup_exists {
@@ -97,9 +112,13 @@ pub fn install_hook(repo_path: &Path, gitguard_binary: &Path) -> Result<()> {
             // 备份会被链式脚本直接执行，必须是可执行文件；
             // 某些工具写出的 Hook 会丢掉执行位，这里显式补上。
             set_executable(&paths.backup)?;
-            build_script(&binary, Some(&paths.backup))?
+            build_script(&binary, repository_id, Some(&paths.backup))?
         }
-        None => build_script(&binary, backup_exists.then_some(&paths.backup))?,
+        None => build_script(
+            &binary,
+            repository_id,
+            backup_exists.then_some(&paths.backup),
+        )?,
     };
 
     write_hook(&paths.hook, &script)
@@ -199,22 +218,43 @@ fn is_gitguard_hook(content: &str) -> bool {
 /// 用户原本的 Hook；GitGuard 拒绝时 `|| exit $?` 立即结束，不会绕到用户 Hook。
 ///
 /// 脚本里不包含任何「跳过确认」的开关：放行只能来自 CLI 的确认流程。
+/// 仓库 id 只用作「这条 Hook 属于哪次登记」的标记，不能改变 CLI 的判定结果。
 ///
 /// 备份路径无法安全地写进 shell（非绝对路径、非 UTF-8、含换行等）时返回错误，
 /// 而不是把可疑的字符串写进 Hook 脚本。
-fn build_script(binary: &str, backup: Option<&Path>) -> Result<String> {
+fn build_script(binary: &str, repository_id: &str, backup: Option<&Path>) -> Result<String> {
     match backup {
         None => Ok(format!(
-            "#!/bin/sh\n{HOOK_MARKER}\nexec {binary} hook pre-push \"$@\"\n"
+            "#!/bin/sh\n{HOOK_MARKER}\nexec {binary} hook pre-push {REPOSITORY_ID_ARG} '{repository_id}' \"$@\"\n"
         )),
         Some(backup) => {
             let backup = shell_quote(backup)?;
             Ok(format!(
                 "#!/bin/sh\n{HOOK_MARKER}\n\
-                 {binary} hook pre-push \"$@\" || exit $?\n\
+                 {binary} hook pre-push {REPOSITORY_ID_ARG} '{repository_id}' \"$@\" || exit $?\n\
                  exec {backup} \"$@\"\n"
             ))
         }
+    }
+}
+
+/// 校验写进脚本的仓库 id。
+///
+/// 这个值是外部传入的（来自配置），只能包含 UUID 字符集；否则一律拒绝，
+/// 不让可疑字符串变成 Hook 脚本里的 shell 片段。
+fn validate_repository_id(repository_id: &str) -> Result<()> {
+    let valid = !repository_id.is_empty()
+        && repository_id.len() <= 36
+        && repository_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-');
+
+    if valid {
+        Ok(())
+    } else {
+        Err(GitGuardError::InvalidInput(
+            "repository id must be a UUID before it can be written into a hook".into(),
+        ))
     }
 }
 
@@ -387,6 +427,11 @@ mod tests {
         PathBuf::from("/opt/gitguard/bin/gitguard")
     }
 
+    /// 写进脚本的仓库 id；形状与配置里的 UUID 一致。
+    fn sample_repository_id() -> &'static str {
+        "00000000-0000-4000-8000-000000000000"
+    }
+
     /// 一个总是以指定退出码结束的假 CLI，用来观察脚本的链式行为。
     fn stub_binary(dir: &Path, exit_code: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -401,13 +446,17 @@ mod tests {
     #[test]
     fn installs_a_hook_that_calls_the_cli_before_the_user_hook() {
         let repo = TestRepo::new();
-        install_hook(&repo.root, &sample_binary()).expect("install hook");
+        install_hook(&repo.root, &sample_binary(), sample_repository_id()).expect("install hook");
 
         let paths = repo.paths();
         let script = fs::read_to_string(&paths.hook).expect("read installed hook");
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains(HOOK_MARKER));
         assert!(script.contains("'/opt/gitguard/bin/gitguard' hook pre-push"));
+        assert!(
+            script.contains(&format!("{REPOSITORY_ID_ARG} '{}'", sample_repository_id())),
+            "脚本必须把仓库 id 传给 CLI，否则记录丢失时 CLI 无法判断这条 Hook 属于哪次登记"
+        );
         // 回归：脚本里不得再出现任何「跳过确认」的环境变量判断。
         assert!(!script.contains("GITGUARD_CONTROLLED_PUSH"));
         assert!(!paths.backup.exists(), "没有旧 Hook 时不应创建备份");
@@ -429,9 +478,14 @@ mod tests {
     #[test]
     fn reinstalling_keeps_a_single_copy_without_backup() {
         let repo = TestRepo::new();
-        install_hook(&repo.root, &sample_binary()).expect("first install");
+        install_hook(&repo.root, &sample_binary(), sample_repository_id()).expect("first install");
         let first = fs::read_to_string(repo.paths().hook).expect("read hook");
-        install_hook(&repo.root, Path::new("/usr/local/bin/gitguard")).expect("second install");
+        install_hook(
+            &repo.root,
+            Path::new("/usr/local/bin/gitguard"),
+            sample_repository_id(),
+        )
+        .expect("second install");
 
         let paths = repo.paths();
         let second = fs::read_to_string(&paths.hook).expect("read hook again");
@@ -448,6 +502,45 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_updates_the_repository_id_in_the_script() {
+        let repo = TestRepo::new();
+        install_hook(&repo.root, &sample_binary(), sample_repository_id()).expect("first install");
+        install_hook(
+            &repo.root,
+            &sample_binary(),
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .expect("second install");
+
+        let script = fs::read_to_string(repo.paths().hook).expect("read hook");
+        assert!(script.contains("'11111111-1111-4111-8111-111111111111'"));
+        assert!(
+            !script.contains(sample_repository_id()),
+            "重写后不得残留旧 id，否则 CLI 会对着错误的记录判断"
+        );
+    }
+
+    #[test]
+    fn install_rejects_a_repository_id_that_could_escape_the_script() {
+        let repo = TestRepo::new();
+        for bad in [
+            "",
+            "not-a-uuid",
+            "00000000-0000-4000-8000-00000000'; rm -rf /",
+            "id\nline",
+        ] {
+            assert!(
+                matches!(
+                    install_hook(&repo.root, &sample_binary(), bad),
+                    Err(GitGuardError::InvalidInput(_))
+                ),
+                "{bad:?} 不得被写进 Hook 脚本"
+            );
+        }
+        assert!(!repo.paths().hook.exists(), "非法 id 不得写出任何 Hook");
+    }
+
+    #[test]
     fn existing_user_hook_is_backed_up_and_chained() {
         let repo = TestRepo::new();
         let marker = repo.root.join("user-hook-ran.txt");
@@ -455,7 +548,7 @@ mod tests {
         repo.write_foreign_hook(&original);
 
         let cli = stub_binary(repo._temp.path(), 0);
-        install_hook(&repo.root, &cli).expect("install hook");
+        install_hook(&repo.root, &cli, sample_repository_id()).expect("install hook");
 
         let paths = repo.paths();
         assert_eq!(
@@ -486,7 +579,7 @@ mod tests {
         let marker = repo.root.join("user-hook-ran.txt");
         repo.write_foreign_hook(&sentinel_hook(&marker));
         let cli = stub_binary(repo._temp.path(), 1);
-        install_hook(&repo.root, &cli).expect("install hook");
+        install_hook(&repo.root, &cli, sample_repository_id()).expect("install hook");
 
         let status = Command::new("sh")
             .arg(repo.paths().hook)
@@ -501,14 +594,15 @@ mod tests {
     fn install_refuses_to_clobber_a_foreign_hook_when_a_backup_exists() {
         let repo = TestRepo::new();
         repo.write_foreign_hook(&sentinel_hook(&repo.root.join("first.txt")));
-        install_hook(&repo.root, &sample_binary()).expect("first install backs up");
+        install_hook(&repo.root, &sample_binary(), sample_repository_id())
+            .expect("first install backs up");
 
         // 模拟外部工具覆盖了 GitGuard 的 Hook，但备份还在：不能再次备份覆盖旧备份。
         let paths = repo.paths();
         fs::write(&paths.hook, "#!/bin/sh\necho replaced\n").expect("replace hook");
 
         assert!(matches!(
-            install_hook(&repo.root, &sample_binary()),
+            install_hook(&repo.root, &sample_binary(), sample_repository_id()),
             Err(GitGuardError::InvalidInput(_))
         ));
         assert!(
@@ -529,7 +623,7 @@ mod tests {
         assert_eq!(check_hook_health(&repo.root), HookStatus::Conflict);
 
         // 有备份但当前 Hook 不是 GitGuard 写的：视为被修改过。
-        install_hook(&repo.root, &sample_binary()).expect("install hook");
+        install_hook(&repo.root, &sample_binary(), sample_repository_id()).expect("install hook");
         let paths = repo.paths();
         fs::write(&paths.hook, "#!/bin/sh\nexit 0\n").expect("rewrite hook");
         assert_eq!(check_hook_health(&repo.root), HookStatus::Modified);
@@ -542,7 +636,7 @@ mod tests {
     #[test]
     fn uninstall_removes_a_plain_hook_and_is_idempotent() {
         let repo = TestRepo::new();
-        install_hook(&repo.root, &sample_binary()).expect("install hook");
+        install_hook(&repo.root, &sample_binary(), sample_repository_id()).expect("install hook");
 
         uninstall_hook(&repo.root).expect("uninstall hook");
         let paths = repo.paths();
@@ -558,7 +652,7 @@ mod tests {
         let repo = TestRepo::new();
         let original = sentinel_hook(&repo.root.join("user-hook-ran.txt"));
         repo.write_foreign_hook(&original);
-        install_hook(&repo.root, &sample_binary()).expect("install hook");
+        install_hook(&repo.root, &sample_binary(), sample_repository_id()).expect("install hook");
 
         uninstall_hook(&repo.root).expect("uninstall hook");
 
@@ -576,7 +670,7 @@ mod tests {
         let repo = TestRepo::new();
         let original = sentinel_hook(&repo.root.join("user-hook-ran.txt"));
         repo.write_foreign_hook(&original);
-        install_hook(&repo.root, &sample_binary()).expect("install hook");
+        install_hook(&repo.root, &sample_binary(), sample_repository_id()).expect("install hook");
         fs::remove_file(repo.paths().hook).expect("delete hook manually");
 
         uninstall_hook(&repo.root).expect("uninstall restores backup");
@@ -625,6 +719,7 @@ mod tests {
         // 空命令，用户原本的 Hook 被悄无声息地丢掉。
         let error = build_script(
             "'/opt/gitguard/bin/gitguard'",
+            sample_repository_id(),
             Some(Path::new("relative/pre-push")),
         )
         .expect_err("relative backup path must not reach the script");

@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 
 use gitguard_core::{GitGuardError, Result};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// 配置文件格式版本。只有在结构发生不兼容变化时才递增。
 pub const SCHEMA_VERSION: u32 = 1;
@@ -34,17 +33,22 @@ const TEMP_FILE_NAME: &str = ".config.json.tmp";
 pub struct AppConfig {
     /// 配置格式版本，目前固定为 [`SCHEMA_VERSION`]。
     pub schema_version: u32,
-    /// 所有仓库共用的默认设置。
+    /// 全局设置：决定「未登记仓库」是否拦截，以及确认超时。
     pub global: GlobalConfig,
-    /// 已登记的仓库列表；没有登记的仓库使用 `global` 里的默认值。
+    /// 已登记的仓库列表；每条记录自己的开关决定是否拦截，不再参考 `global`。
     pub repositories: Vec<RepoConfig>,
 }
 
-/// 全局默认设置。
+/// 全局设置：只对「没有登记过的仓库」生效。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalConfig {
-    /// 未单独配置的仓库默认是否需要推送确认。
-    pub default_push_confirmation: bool,
+    /// 未登记的仓库是否需要推送确认；登记过的仓库只看自己的开关。
+    ///
+    /// 默认关闭：未登记意味着用户没在桌面端明确添加过这个仓库，此时不拦截，
+    /// 避免安装后所有仓库的 push 都被卡住。旧配置里的 `default_push_confirmation`
+    /// 仍可读取，保存时会写成新键。
+    #[serde(alias = "default_push_confirmation")]
+    pub require_confirmation_for_unregistered_repositories: bool,
     /// 等待用户确认的超时时间（秒），超时按拒绝处理。
     pub confirmation_timeout_seconds: u64,
 }
@@ -56,7 +60,9 @@ pub struct RepoConfig {
     pub repository_id: String,
     /// 仓库的规范路径，用于把用户的目录匹配到这条记录。
     pub canonical_path: String,
-    /// 这个仓库是否启用推送确认；覆盖 `global.default_push_confirmation`。
+    /// 这个仓库是否启用推送确认。
+    ///
+    /// 登记过的仓库只按这个字段判断，全局设置不参与，也不会被“继承”后覆盖。
     pub push_confirmation_enabled: bool,
     /// Hook 的安装状态；这里只保存状态，不执行任何安装或修复动作。
     pub hook_status: HookStatus,
@@ -91,10 +97,10 @@ impl Default for AppConfig {
 }
 
 impl Default for GlobalConfig {
-    /// 默认要求推送确认，超时 180 秒。
+    /// 未登记的仓库默认不拦截；超时 180 秒。
     fn default() -> Self {
         Self {
-            default_push_confirmation: true,
+            require_confirmation_for_unregistered_repositories: false,
             confirmation_timeout_seconds: 180,
         }
     }
@@ -164,12 +170,17 @@ pub fn find_repo_mut<'a>(
 /// 登记或更新一个仓库，并返回它的最新配置。
 ///
 /// - 已登记：只更新 `push_confirmation_enabled`，保留原有 `repository_id` 与 Hook 状态；
-/// - 未登记：新建一条记录，分配新的 UUID，Hook 状态记为 [`HookStatus::Unknown`]。
+/// - 未登记：按传入的 `repository_id` 新建一条记录，Hook 状态记为 [`HookStatus::Unknown`]。
+///
+/// `repository_id` 会同时写进 Hook 脚本，CLI 靠它把 Hook 与这条记录对应起来。
+/// 已登记的仓库必须由调用方传入原有 id，否则重写出来的 Hook 会带着一个配置里不存在的
+/// id，CLI 会按「记录丢失」处理（仍要求确认，不会静默放行）。
 ///
 /// 调用方修改完返回值后，需要再调用 [`save_config`] 才会落到磁盘。
 pub fn add_or_update_repo(
     config: &mut AppConfig,
     canonical_path: String,
+    repository_id: String,
     enabled: bool,
 ) -> &mut RepoConfig {
     let existing = config
@@ -185,7 +196,7 @@ pub fn add_or_update_repo(
         }
         None => {
             config.repositories.push(RepoConfig {
-                repository_id: Uuid::new_v4().to_string(),
+                repository_id,
                 canonical_path,
                 push_confirmation_enabled: enabled,
                 hook_status: HookStatus::Unknown,
@@ -198,14 +209,56 @@ pub fn add_or_update_repo(
     &mut config.repositories[index]
 }
 
+/// 某个仓库本次 push 是否需要用户确认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushConfirmationState {
+    /// 保护开启：必须拿到用户确认才能放行。
+    Required,
+    /// 用户显式关闭了这个仓库的保护：直接放行。
+    Disabled,
+    /// Hook 脚本带着仓库 id，但配置里找不到同 id 的记录。
+    ///
+    /// 常见原因是配置文件被删除或回滚、仓库目录被移动后又重新初始化。此时无法
+    /// 知道用户原本的开关，调用方必须按「需要确认」处理，不能静默放行。
+    RecordMissing,
+}
+
 /// 判断某个仓库当前是否需要推送确认。
 ///
-/// 仓库自己的设置优先；没有登记过的仓库回落到全局默认值。
-/// 默认值是「需要确认」，因此未登记的仓库不会因为缺少配置而被静默放行。
-pub fn is_push_confirmation_enabled(config: &AppConfig, repo_path: &str) -> bool {
+/// `repository_id` 由 Hook 脚本通过 `--repository-id` 传入，旧版脚本没有这个参数。
+/// 判定顺序：
+/// 1. 带 id 且配置里有同 id 的记录：只看该记录的 `push_confirmation_enabled`，
+///    因此仓库目录改名或移动后仍沿用用户原来的选择；
+/// 2. 带 id 但配置里没有同 id 的记录：返回 [`PushConfirmationState::RecordMissing`]；
+/// 3. 不带 id：按规范路径查记录，查到就看它的开关；查不到才回落到全局设置，
+///    其默认值为 `false`——保护是「在桌面端显式添加仓库」才开启的。
+pub fn push_confirmation_state(
+    config: &AppConfig,
+    repo_path: &str,
+    repository_id: Option<&str>,
+) -> PushConfirmationState {
+    if let Some(repository_id) = repository_id {
+        return match config
+            .repositories
+            .iter()
+            .find(|repo| repo.repository_id == repository_id)
+        {
+            Some(repo) if repo.push_confirmation_enabled => PushConfirmationState::Required,
+            Some(_) => PushConfirmationState::Disabled,
+            None => PushConfirmationState::RecordMissing,
+        };
+    }
+
     match find_repo(config, repo_path) {
-        Some(repo) => repo.push_confirmation_enabled,
-        None => config.global.default_push_confirmation,
+        Some(repo) if repo.push_confirmation_enabled => PushConfirmationState::Required,
+        Some(_) => PushConfirmationState::Disabled,
+        None if config
+            .global
+            .require_confirmation_for_unregistered_repositories =>
+        {
+            PushConfirmationState::Required
+        }
+        None => PushConfirmationState::Disabled,
     }
 }
 
@@ -304,6 +357,12 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    /// 生成一个新的仓库 id；真实调用方由桌面端生成，测试里同样只关心形状。
+    fn new_id() -> String {
+        Uuid::new_v4().to_string()
+    }
 
     /// 在临时目录里拼出与真实配置同名的文件路径。
     /// 测试绝不触碰用户真实的配置目录。
@@ -319,9 +378,41 @@ mod tests {
     fn default_config_has_expected_values() {
         let config = AppConfig::default();
         assert_eq!(config.schema_version, SCHEMA_VERSION);
-        assert!(config.global.default_push_confirmation);
+        // 未登记的仓库默认不受保护：默认拦截会让刚装好的工具立刻卡住所有 push。
+        assert!(
+            !config
+                .global
+                .require_confirmation_for_unregistered_repositories
+        );
         assert_eq!(config.global.confirmation_timeout_seconds, 180);
         assert!(config.repositories.is_empty());
+    }
+
+    #[test]
+    fn legacy_default_push_confirmation_key_is_still_readable() {
+        // 字段改名前写出的配置仍含 `default_push_confirmation`；读不出来会让
+        // 升级后的每一次 push 都因「配置无法解析」被拒绝。
+        let dir = tempdir();
+        let path = temp_config_path(dir.path());
+        fs::write(
+            &path,
+            br#"{"schema_version":1,"global":{"default_push_confirmation":true,"confirmation_timeout_seconds":90},"repositories":[]}"#,
+        )
+        .expect("write legacy config");
+
+        let config = load_config_from(&path).expect("legacy config should load");
+        assert!(
+            config
+                .global
+                .require_confirmation_for_unregistered_repositories
+        );
+        assert_eq!(config.global.confirmation_timeout_seconds, 90);
+
+        // 重新保存后应写成新键，旧键不再出现。
+        save_config_to(&config, &path).expect("save config");
+        let saved = fs::read_to_string(&path).expect("read saved config");
+        assert!(saved.contains("require_confirmation_for_unregistered_repositories"));
+        assert!(!saved.contains("default_push_confirmation"));
     }
 
     #[test]
@@ -343,7 +434,7 @@ mod tests {
             },
             ..AppConfig::default()
         };
-        add_or_update_repo(&mut config, "/Users/dev/project".into(), false);
+        add_or_update_repo(&mut config, "/Users/dev/project".into(), new_id(), false);
 
         let json = serde_json::to_string(&config).expect("config should serialize");
         let restored: AppConfig = serde_json::from_str(&json).expect("json should deserialize");
@@ -354,8 +445,8 @@ mod tests {
     #[test]
     fn find_repo_locates_by_canonical_path() {
         let mut config = AppConfig::default();
-        add_or_update_repo(&mut config, "/repos/a".into(), true);
-        add_or_update_repo(&mut config, "/repos/b".into(), false);
+        add_or_update_repo(&mut config, "/repos/a".into(), new_id(), true);
+        add_or_update_repo(&mut config, "/repos/b".into(), new_id(), false);
 
         assert!(find_repo(&config, "/repos/a").is_some());
         assert_eq!(
@@ -368,7 +459,7 @@ mod tests {
     #[test]
     fn find_repo_mut_updates_in_place() {
         let mut config = AppConfig::default();
-        add_or_update_repo(&mut config, "/repos/a".into(), true);
+        add_or_update_repo(&mut config, "/repos/a".into(), new_id(), true);
 
         let repo = find_repo_mut(&mut config, "/repos/a").expect("repo should exist");
         repo.hook_status = HookStatus::Healthy;
@@ -383,45 +474,92 @@ mod tests {
     #[test]
     fn add_or_update_repo_creates_then_updates() {
         let mut config = AppConfig::default();
+        let created_id = new_id();
 
-        let created_id = add_or_update_repo(&mut config, "/repos/a".into(), true)
-            .repository_id
-            .clone();
+        let created = add_or_update_repo(&mut config, "/repos/a".into(), created_id.clone(), true);
+        assert_eq!(created.repository_id, created_id, "新记录应使用传入的 id");
         assert_eq!(config.repositories.len(), 1);
-        assert!(
-            Uuid::parse_str(&created_id).is_ok(),
-            "repository id should be a UUID, got {created_id}"
-        );
         assert_eq!(config.repositories[0].hook_status, HookStatus::Unknown);
 
-        let updated = add_or_update_repo(&mut config, "/repos/a".into(), false);
+        // 更新时即使传了另一个 id，也必须沿用已登记的那一个，否则 Hook 里的标记会失配。
+        let updated = add_or_update_repo(&mut config, "/repos/a".into(), new_id(), false);
         assert_eq!(updated.repository_id, created_id, "更新时 ID 必须保持不变");
         assert!(!updated.push_confirmation_enabled);
         assert_eq!(config.repositories.len(), 1, "同一路径不能重复登记");
     }
 
     #[test]
-    fn repo_setting_overrides_global_default() {
-        let mut config = AppConfig::default(); // 全局默认要求确认
-        add_or_update_repo(&mut config, "/repos/off".into(), false);
+    fn registered_repo_follows_its_own_switch_only() {
+        let mut config = AppConfig::default(); // 未登记仓库默认不拦截
+        let off_id = new_id();
+        add_or_update_repo(&mut config, "/repos/off".into(), off_id.clone(), false);
 
-        assert!(
-            !is_push_confirmation_enabled(&config, "/repos/off"),
-            "仓库级关闭必须覆盖全局默认"
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/off", Some(&off_id)),
+            PushConfirmationState::Disabled,
+            "仓库级关闭必须覆盖全局设置"
         );
-        assert!(
-            is_push_confirmation_enabled(&config, "/repos/unregistered"),
-            "未登记的仓库应回落到全局默认（true）"
+        // 旧版脚本不带 id，仍按规范路径查记录。
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/off", None),
+            PushConfirmationState::Disabled
+        );
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/unregistered", None),
+            PushConfirmationState::Disabled,
+            "未登记的仓库应回落到全局设置（默认 false）"
         );
 
-        config.global.default_push_confirmation = false;
-        assert!(!is_push_confirmation_enabled(
-            &config,
-            "/repos/unregistered"
-        ));
+        config
+            .global
+            .require_confirmation_for_unregistered_repositories = true;
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/unregistered", None),
+            PushConfirmationState::Required
+        );
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/off", None),
+            PushConfirmationState::Disabled,
+            "全局开关不得改写已登记仓库的开关"
+        );
 
-        add_or_update_repo(&mut config, "/repos/on".into(), true);
-        assert!(is_push_confirmation_enabled(&config, "/repos/on"));
+        let on_id = new_id();
+        add_or_update_repo(&mut config, "/repos/on".into(), on_id.clone(), true);
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/on", Some(&on_id)),
+            PushConfirmationState::Required
+        );
+    }
+
+    #[test]
+    fn repository_id_lookup_survives_a_moved_repository() {
+        let mut config = AppConfig::default();
+        let id = new_id();
+        add_or_update_repo(&mut config, "/repos/old-path".into(), id.clone(), true);
+
+        // 目录改名或移动后路径不再匹配，但 Hook 里的 id 仍能找到原记录。
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/new-path", Some(&id)),
+            PushConfirmationState::Required
+        );
+    }
+
+    #[test]
+    fn a_repository_id_without_a_record_must_not_fall_back_to_allow() {
+        // 回归：配置文件被删除或回滚后 Hook 仍在。带 id 的脚本必须按「记录丢失」
+        // 处理（调用方要求确认），不能因为「查不到记录」就静默放行。
+        let config = AppConfig::default();
+        let id = new_id();
+
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/a", Some(&id)),
+            PushConfirmationState::RecordMissing
+        );
+        // 对照：旧版脚本没有 id 时只能回落到全局开关（默认关闭）。
+        assert_eq!(
+            push_confirmation_state(&config, "/repos/a", None),
+            PushConfirmationState::Disabled
+        );
     }
 
     #[test]
@@ -470,7 +608,7 @@ mod tests {
             },
             ..AppConfig::default()
         };
-        add_or_update_repo(&mut config, "/repos/a".into(), true);
+        add_or_update_repo(&mut config, "/repos/a".into(), new_id(), true);
 
         save_config_to(&config, &path).expect("保存应成功");
         assert!(path.exists(), "正式文件应已写入");

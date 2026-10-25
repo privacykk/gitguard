@@ -19,6 +19,8 @@ gitguard-ipc.workspace = true
 gitguard-git.workspace = true
 gitguard-hook.workspace = true
 serde.workspace = true
+# 仓库 id：写进 Hook 脚本，CLI 用它把 Hook 与配置记录对应起来。
+uuid.workspace = true
 tauri = { version = "2", features = [] }
 # 文件夹选择对话框：让用户挑选仓库目录，避免手写相对路径。
 tauri-plugin-dialog = "2"

@@ -13,6 +13,8 @@
 //! 也不把「隐藏按钮」当作安全控制——CLI 只认 IPC 返回的 `Confirmed`，
 //! 其余情况（含本进程未运行）一律拒绝推送。
 
+mod menu;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,6 +28,7 @@ use gitguard_core::{
 use gitguard_ipc::{IpcHandler, IpcServer};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, UserAttentionType};
+use uuid::Uuid;
 
 /// 通知前端「有新的待确认请求」的 Tauri 事件名。
 const EVENT_PUSH_REQUEST_RECEIVED: &str = "push-request-received";
@@ -117,13 +120,16 @@ struct SettingsView {
     config_error: Option<&'static str>,
     /// IPC 服务未能启动的错误码；有值时 Hook 一定连不上，推送会被拒绝。
     ipc_error: Option<&'static str>,
+    /// 配置文件路径；设置页只读展示，前端不拼接也不猜测。
+    config_path: String,
 }
 
-/// 全局设置。
+/// 全局设置：只影响未登记的仓库。
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GlobalSettingsView {
-    default_push_confirmation: bool,
+    /// 未登记仓库是否需要推送确认；登记过的仓库各看自己的开关。
+    require_confirmation_for_unregistered_repositories: bool,
     confirmation_timeout_seconds: u64,
 }
 
@@ -273,7 +279,10 @@ impl AppState {
 
         SettingsView {
             global: GlobalSettingsView {
-                default_push_confirmation: configuration.config.global.default_push_confirmation,
+                require_confirmation_for_unregistered_repositories: configuration
+                    .config
+                    .global
+                    .require_confirmation_for_unregistered_repositories,
                 confirmation_timeout_seconds: configuration
                     .config
                     .global
@@ -282,6 +291,7 @@ impl AppState {
             repositories,
             config_error: configuration.load_error,
             ipc_error: *lock(&self.ipc_error),
+            config_path: self.config_path.to_string_lossy().into_owned(),
         }
     }
 
@@ -289,6 +299,10 @@ impl AppState {
     ///
     /// 顺序是「先安装 Hook、后记录配置」：安装失败就不留下「已保护」的假象；
     /// 记录失败时 Hook 已就位，界面上的状态会在下次刷新时修正为真实值。
+    ///
+    /// 已经登记过的路径只刷新 Hook 脚本（升级后用来清掉旧脚本的绕过判断），
+    /// 沿用原来的 `repository_id` 与保护开关：重新添加不是「关闭保护」的捷径，
+    /// 开关只能通过 [`Self::set_protection`] 显式修改。
     fn add_repository(&self, path: &Path, cli: &Path, enabled: bool) -> Result<RepositoryView> {
         // 允许用户选择仓库内的子目录，统一解析成仓库根目录。
         let canonical = gitguard_git::repo_canonical_path(path)?;
@@ -299,14 +313,25 @@ impl AppState {
             ))
         })?;
 
-        gitguard_hook::install_hook(&canonical, cli)?;
+        let mut configuration = lock(&self.configuration);
+        let (repository_id, enabled) = match gitguard_config::find_repo(&configuration.config, key)
+        {
+            Some(existing) => (
+                existing.repository_id.clone(),
+                existing.push_confirmation_enabled,
+            ),
+            None => (Uuid::new_v4().to_string(), enabled),
+        };
+
+        // Hook 里的仓库 id 必须与配置记录一致，CLI 才能判断记录是否丢失。
+        gitguard_hook::install_hook(&canonical, cli, &repository_id)?;
         let status = gitguard_hook::check_hook_health(&canonical);
 
-        let mut configuration = lock(&self.configuration);
         let view = {
             let repo = gitguard_config::add_or_update_repo(
                 &mut configuration.config,
                 key.to_string(),
+                repository_id,
                 enabled,
             );
             repo.hook_status = status;
@@ -332,12 +357,15 @@ impl AppState {
         self.persist(&configuration)
     }
 
-    /// 修改「新添加的仓库是否默认启用推送保护」。
+    /// 修改「未登记的仓库是否需要推送确认」。
     ///
-    /// 只影响之后添加的仓库与未登记仓库，不会批量改写已有仓库的开关。
-    fn set_default_protection(&self, enabled: bool) -> Result<()> {
+    /// 只影响未登记仓库；已登记仓库的开关不会被批量改写。
+    fn set_unregistered_protection(&self, enabled: bool) -> Result<()> {
         let mut configuration = lock(&self.configuration);
-        configuration.config.global.default_push_confirmation = enabled;
+        configuration
+            .config
+            .global
+            .require_confirmation_for_unregistered_repositories = enabled;
         self.persist(&configuration)
     }
 
@@ -657,6 +685,26 @@ fn get_settings(state: State<'_, Arc<AppState>>) -> SettingsView {
     state.settings()
 }
 
+/// 按界面语言重建原生菜单。
+///
+/// 菜单只是展示层：未知 locale 回落到默认语言，重建失败也只写 stderr，
+/// 不影响界面与任何确认或放行判断。
+#[tauri::command]
+fn set_app_menu(locale: String, app: tauri::AppHandle) -> std::result::Result<(), CommandError> {
+    let menu =
+        menu::build_menu(&app, menu::MenuLanguage::from_locale(&locale)).map_err(|error| {
+            eprintln!("gitguard: could not build the application menu: {error}");
+            command_error(ERROR_INTERNAL)
+        })?;
+
+    app.set_menu(menu).map_err(|error| {
+        eprintln!("gitguard: could not apply the application menu: {error}");
+        command_error(ERROR_INTERNAL)
+    })?;
+
+    Ok(())
+}
+
 /// 校验并归一化用户填写的仓库路径。
 ///
 /// 只接受绝对路径：相对路径会按桌面端进程的当前目录解析（从 Finder 启动时通常是 `/`），
@@ -716,14 +764,14 @@ fn toggle_repo_protection(
         })
 }
 
-/// 修改新仓库的默认推送保护开关。
+/// 修改未登记仓库的推送确认开关。
 #[tauri::command]
-fn set_default_protection(
+fn set_unregistered_protection(
     enabled: bool,
     state: State<'_, Arc<AppState>>,
 ) -> std::result::Result<(), CommandError> {
-    state.set_default_protection(enabled).map_err(|error| {
-        eprintln!("gitguard: could not set the default push protection: {error}");
+    state.set_unregistered_protection(enabled).map_err(|error| {
+        eprintln!("gitguard: could not change the unregistered repository setting: {error}");
         command_error(ERROR_CONFIGURATION_WRITE_FAILED)
     })
 }
@@ -783,10 +831,19 @@ pub fn run() {
     let setup_state = Arc::clone(&state);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // 菜单只通知前端打开设置页；菜单项本身不承载业务逻辑。
+        .on_menu_event(|app, event| {
+            if event.id() == menu::SETTINGS_MENU_ID {
+                let _ = app.emit(menu::EVENT_OPEN_SETTINGS, ());
+            }
+        })
         .manage(state)
         .setup(move |app| {
             // 保存 AppHandle，IPC 线程才能向前端推送事件。
             *lock(&setup_state.app_handle) = Some(app.handle().clone());
+            // 先用默认语言建好菜单，前端挂载后会按实际界面语言重建一次。
+            let menu = menu::build_menu(app.handle(), menu::MenuLanguage::ZhCn)?;
+            app.set_menu(menu)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -794,9 +851,10 @@ pub fn run() {
             confirm_push,
             cancel_push,
             get_settings,
+            set_app_menu,
             add_repository,
             toggle_repo_protection,
-            set_default_protection,
+            set_unregistered_protection,
             set_confirmation_timeout,
         ])
         .run(tauri::generate_context!())
@@ -885,11 +943,37 @@ mod tests {
         let state = temp_state(&temp);
         let settings = state.settings();
 
-        assert!(settings.global.default_push_confirmation);
+        // 未登记的仓库默认不拦截。
+        assert!(
+            !settings
+                .global
+                .require_confirmation_for_unregistered_repositories
+        );
         assert_eq!(settings.global.confirmation_timeout_seconds, 180);
         assert!(settings.repositories.is_empty());
         assert!(settings.config_error.is_none());
         assert!(settings.ipc_error.is_none());
+        assert!(
+            settings.config_path.ends_with("config.json"),
+            "设置页需要展示实际使用的配置文件路径"
+        );
+    }
+
+    #[test]
+    fn settings_view_exposes_the_config_path_in_camel_case() {
+        // 前端按 camelCase 校验 `configPath`；字段名不一致会让设置页整体不可用。
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        let json = serde_json::to_value(state.settings()).expect("settings should serialize");
+
+        assert_eq!(
+            json["configPath"].as_str(),
+            Some(state.config_path.to_string_lossy().as_ref())
+        );
+        assert!(
+            json.get("config_path").is_none(),
+            "前端不认 snake_case 字段名"
+        );
     }
 
     #[test]
@@ -917,6 +1001,42 @@ mod tests {
         assert_eq!(
             persisted.repositories[0].canonical_path,
             view.canonical_path
+        );
+    }
+
+    #[test]
+    fn adding_a_registered_repository_keeps_its_switch_and_id() {
+        // 回归：升级后按 README 重新添加已登记仓库，只应刷新 Hook 脚本；
+        // 表单默认不勾选，但重新添加不得把已经开着的保护静默关掉。
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        let repo = TestRepo::new();
+        let cli = temp.path().join("gitguard");
+        fs::write(&cli, "#!/bin/sh\n").expect("create fake cli");
+
+        let first = state
+            .add_repository(&repo.root, &cli, true)
+            .expect("repository should be added");
+        let second = state
+            .add_repository(&repo.root, &cli, false)
+            .expect("repository should be re-added");
+
+        assert!(second.push_confirmation_enabled, "重新添加不得关闭保护");
+        assert_eq!(
+            second.repository_id, first.repository_id,
+            "同一仓库的记录 id 必须保持稳定"
+        );
+
+        // Hook 脚本里的 id 必须与记录一致，否则 CLI 会把它当成记录丢失。
+        let script = fs::read_to_string(
+            gitguard_hook::hook_paths(&repo.root)
+                .expect("resolve hook paths")
+                .hook,
+        )
+        .expect("read installed hook");
+        assert!(
+            script.contains(&first.repository_id),
+            "Hook 必须携带登记记录的 id"
         );
     }
 
@@ -971,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn default_protection_and_add_time_switch_are_persisted() {
+    fn unregistered_setting_and_add_time_switch_are_persisted() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let state = temp_state(&temp);
         let repo = TestRepo::new();
@@ -979,22 +1099,30 @@ mod tests {
         fs::write(&cli, "#!/bin/sh\n").expect("create fake cli");
 
         state
-            .set_default_protection(false)
-            .expect("change the default");
-        // 添加时就关闭保护：不需要事后再点一次开关。
+            .set_unregistered_protection(true)
+            .expect("change the unregistered setting");
+        // 添加时就关闭保护：全局开关不参与，只看该仓库自己的开关。
         let view = state
             .add_repository(&repo.root, &cli, false)
             .expect("repository should be added");
 
         assert!(!view.push_confirmation_enabled);
         let settings = state.settings();
-        assert!(!settings.global.default_push_confirmation);
+        assert!(
+            settings
+                .global
+                .require_confirmation_for_unregistered_repositories
+        );
         assert!(!settings.repositories[0].push_confirmation_enabled);
 
-        // 落盘后重新加载仍然是关闭状态，避免只改了内存。
+        // 落盘后重新加载仍然一致，避免只改了内存。
         let persisted = gitguard_config::load_config_from(&temp.path().join("config.json"))
             .expect("saved config should load");
-        assert!(!persisted.global.default_push_confirmation);
+        assert!(
+            persisted
+                .global
+                .require_confirmation_for_unregistered_repositories
+        );
         assert!(!persisted.repositories[0].push_confirmation_enabled);
     }
 

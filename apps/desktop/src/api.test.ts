@@ -3,8 +3,10 @@ import {
   GitGuardCommandError,
   getPendingPush,
   getSettings,
+  listenOpenSettings,
   parsePushConfirmation,
   pickRepositoryDirectory,
+  setAppMenu,
 } from "./api";
 
 const mocks = vi.hoisted(() => ({
@@ -86,13 +88,60 @@ describe("command wrappers", () => {
 
   it("rejects with a stable error code instead of rendering unchecked settings", async () => {
     mocks.invoke.mockResolvedValue({
-      global: { defaultPushConfirmation: true },
+      global: { requireConfirmationForUnregisteredRepositories: true },
     });
 
     await expect(getSettings()).rejects.toBeInstanceOf(GitGuardCommandError);
     await expect(getSettings()).rejects.toMatchObject({
       code: "internal_error",
     });
+  });
+
+  it("accepts settings that include the configuration path", async () => {
+    mocks.invoke.mockResolvedValue({
+      global: {
+        requireConfirmationForUnregisteredRepositories: false,
+        confirmationTimeoutSeconds: 180,
+      },
+      repositories: [],
+      configError: null,
+      ipcError: null,
+      configPath: "/tmp/gitguard/config.json",
+    });
+
+    await expect(getSettings()).resolves.toMatchObject({
+      configPath: "/tmp/gitguard/config.json",
+    });
+  });
+
+  it("forwards the interface locale when rebuilding the native menu", async () => {
+    mocks.invoke.mockResolvedValue(null);
+
+    await setAppMenu("en-US");
+
+    expect(mocks.invoke).toHaveBeenCalledWith("set_app_menu", {
+      locale: "en-US",
+    });
+  });
+});
+
+describe("listenOpenSettings", () => {
+  beforeEach(() => {
+    mocks.listen.mockReset();
+  });
+
+  it("subscribes to the menu event and returns the unsubscribe function", async () => {
+    const stop = vi.fn();
+    mocks.listen.mockResolvedValue(stop);
+
+    const result = await listenOpenSettings(() => undefined);
+
+    expect(mocks.listen).toHaveBeenCalledWith(
+      "open-settings",
+      expect.any(Function),
+    );
+    result();
+    expect(stop).toHaveBeenCalled();
   });
 });
 

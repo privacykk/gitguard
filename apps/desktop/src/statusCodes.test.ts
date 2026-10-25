@@ -15,15 +15,13 @@ describe("hook status codes", () => {
 
     expect(new Set(keys).size).toBe(HOOK_STATUS_CODES.length);
     for (const key of keys) {
-      expect(key).toMatch(/^settings\.hookStatus\./);
+      expect(key).toMatch(/^hookStatus\./);
     }
   });
 
   it("falls back to the unknown key instead of inferring a healthy hook", () => {
-    expect(toHookStatusMessageKey("SomethingElse")).toBe(
-      "settings.hookStatus.unknown",
-    );
-    expect(toHookStatusMessageKey(null)).toBe("settings.hookStatus.unknown");
+    expect(toHookStatusMessageKey("SomethingElse")).toBe("hookStatus.unknown");
+    expect(toHookStatusMessageKey(null)).toBe("hookStatus.unknown");
     expect(isHookStatusCode("healthy")).toBe(false);
     expect(isHookStatusCode("Healthy")).toBe(true);
   });

@@ -28,9 +28,10 @@ const selectedLocale = computed({
 </script>
 
 <template>
-  <div class="language-switch">
+  <div class="flex flex-wrap items-center gap-2">
+    <!-- 外层已有「界面语言」标题，这里保留隐藏 label 供辅助技术识别下拉框。 -->
     <label
-      class="language-switch__label"
+      class="sr-only"
       for="locale-select"
     >
       {{ t("language.label") }}
@@ -38,7 +39,7 @@ const selectedLocale = computed({
     <select
       id="locale-select"
       v-model="selectedLocale"
-      class="language-switch__select"
+      class="h-8 max-w-56 rounded-md border border-line bg-surface px-2.5 text-sm text-ink transition-colors hover:border-brand-500 focus:border-brand-600"
     >
       <option
         v-for="option in SUPPORTED_LOCALES"
@@ -50,20 +51,3 @@ const selectedLocale = computed({
     </select>
   </div>
 </template>
-
-<style scoped>
-.language-switch {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-  justify-content: flex-end;
-  font-size: 0.875rem;
-}
-
-.language-switch__select {
-  padding: 0.25rem 0.5rem;
-  border: 1px solid #d7dee8;
-  border-radius: 0.375rem;
-  background: #ffffff;
-}
-</style>

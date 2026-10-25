@@ -38,7 +38,8 @@ describe("locale switching", () => {
   it("switches messages, document language and stored preference", () => {
     setLocale("en-US");
 
-    expect(i18n.global.t("settings.title")).toBe("Repositories");
+    expect(i18n.global.t("settings.title")).toBe("Settings");
+    expect(i18n.global.t("nav.dashboard")).toBe("Overview");
     expect(document.documentElement.lang).toBe("en-US");
     expect(localStorage.getItem("gitguard.locale")).toBe("en-US");
   });

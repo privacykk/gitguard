@@ -17,11 +17,11 @@ export const HOOK_STATUS_CODES = [
 export type HookStatusCode = (typeof HOOK_STATUS_CODES)[number];
 
 const HOOK_STATUS_MESSAGE_KEYS: Record<HookStatusCode, string> = {
-  Healthy: "settings.hookStatus.healthy",
-  Missing: "settings.hookStatus.missing",
-  Modified: "settings.hookStatus.modified",
-  Conflict: "settings.hookStatus.conflict",
-  Unknown: "settings.hookStatus.unknown",
+  Healthy: "hookStatus.healthy",
+  Missing: "hookStatus.missing",
+  Modified: "hookStatus.modified",
+  Conflict: "hookStatus.conflict",
+  Unknown: "hookStatus.unknown",
 };
 
 /** 判断 command 返回值是否属于已知的 Hook 状态码。 */
@@ -34,6 +34,25 @@ export function toHookStatusMessageKey(value: unknown): string {
   return isHookStatusCode(value)
     ? HOOK_STATUS_MESSAGE_KEYS[value]
     : HOOK_STATUS_MESSAGE_KEYS.Unknown;
+}
+
+/** 界面展示用的色调；只影响颜色，不参与任何放行判断。 */
+export type StatusTone = "success" | "warning" | "danger" | "info";
+
+const HOOK_STATUS_TONES: Record<HookStatusCode, StatusTone> = {
+  Healthy: "success",
+  Missing: "info",
+  Modified: "danger",
+  Conflict: "danger",
+  // 无法判断一律用警示色，绝不能让它看起来和「正常」一样。
+  Unknown: "warning",
+};
+
+/** 把 Hook 状态码转成色调；未知值同样归入警示色。 */
+export function toHookStatusTone(value: unknown): StatusTone {
+  return isHookStatusCode(value)
+    ? HOOK_STATUS_TONES[value]
+    : HOOK_STATUS_TONES.Unknown;
 }
 
 /** 后端命令可能返回的错误码（与 `apps/desktop/src-tauri/src/lib.rs` 保持一致）。 */

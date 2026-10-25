@@ -41,9 +41,9 @@ export interface PushConfirmation {
   receivedAtEpochSecs: number;
 }
 
-/** 全局设置。 */
+/** 全局设置：只影响未登记的仓库。 */
 export interface GlobalSettings {
-  defaultPushConfirmation: boolean;
+  requireConfirmationForUnregisteredRepositories: boolean;
   confirmationTimeoutSeconds: number;
 }
 
@@ -61,6 +61,8 @@ export interface Settings {
   repositories: RepositorySettings[];
   configError: string | null;
   ipcError: string | null;
+  /** 桌面端实际读写的配置文件路径；只读展示，前端不拼接也不猜测。 */
+  configPath: string;
 }
 
 /** command 失败时返回的稳定错误码。 */
@@ -181,9 +183,12 @@ function parseSettings(value: unknown): Settings | null {
     return null;
   }
 
-  const { defaultPushConfirmation, confirmationTimeoutSeconds } = value.global;
+  const {
+    requireConfirmationForUnregisteredRepositories,
+    confirmationTimeoutSeconds,
+  } = value.global;
   if (
-    typeof defaultPushConfirmation !== "boolean" ||
+    typeof requireConfirmationForUnregisteredRepositories !== "boolean" ||
     typeof confirmationTimeoutSeconds !== "number" ||
     !Array.isArray(value.repositories)
   ) {
@@ -213,12 +218,20 @@ function parseSettings(value: unknown): Settings | null {
     });
   }
 
+  if (typeof value.configPath !== "string") {
+    return null;
+  }
+
   return {
-    global: { defaultPushConfirmation, confirmationTimeoutSeconds },
+    global: {
+      requireConfirmationForUnregisteredRepositories,
+      confirmationTimeoutSeconds,
+    },
     repositories,
     configError:
       typeof value.configError === "string" ? value.configError : null,
     ipcError: typeof value.ipcError === "string" ? value.ipcError : null,
+    configPath: value.configPath,
   };
 }
 
@@ -314,10 +327,12 @@ export async function toggleProtection(
   }
 }
 
-/** 修改新仓库的默认推送保护开关。 */
-export async function setDefaultProtection(enabled: boolean): Promise<void> {
+/** 修改未登记的仓库是否需要推送确认。 */
+export async function setUnregisteredProtection(
+  enabled: boolean,
+): Promise<void> {
   try {
-    await invoke("set_default_protection", { enabled });
+    await invoke("set_unregistered_protection", { enabled });
   } catch (reason) {
     throw toCommandError(reason);
   }
@@ -330,6 +345,27 @@ export async function setConfirmationTimeout(seconds: number): Promise<void> {
   } catch (reason) {
     throw toCommandError(reason);
   }
+}
+
+/**
+ * 让 Rust 侧按当前界面语言重建原生菜单。
+ *
+ * 菜单是展示层：失败只影响菜单文案，不影响任何确认或放行判断。
+ */
+export async function setAppMenu(locale: string): Promise<void> {
+  try {
+    await invoke("set_app_menu", { locale });
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/** 监听原生菜单里的「设置…」；返回取消监听的函数。 */
+export async function listenOpenSettings(
+  handler: () => void,
+): Promise<() => void> {
+  const unlisten = await listen("open-settings", () => handler());
+  return unlisten;
 }
 
 /**

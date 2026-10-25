@@ -1,24 +1,154 @@
+/*
+ * 全局样式入口。
+ *
+ * 只做四件事：
+ * 1. 把 Element Plus 的样式放进更低的层，Tailwind 原子类才能覆盖它的默认宽度与颜色；
+ * 2. 引入 Tailwind，并在 `@theme` 里声明设计令牌（颜色、圆角、阴影、字体）；
+ * 3. 把 Element Plus 的主题变量对齐到这些令牌，组件与工具类共用一套色板；
+ * 4. 少量无法用工具类表达的基础样式（滚动条、焦点轮廓）。
+ *
+ * 组件内部一律使用 Tailwind 工具类或 scoped 样式，不再往这里堆砌业务类。
+ */
+
+/* 层顺序决定优先级：Element Plus 排在 preflight 之后、utilities 之前，
+ * 于是它的组件默认样式能盖住 Tailwind 的基础重置，又能被原子类覆盖。 */
+@layer theme, base, element-plus, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+
+/* Element Plus 按需样式：与 `src/elementPlus.ts` 的注册清单一一对应。
+ * 只引 theme-chalk 的单组件文件，不引整份 index.css；`el-icon` 的样式在 base.css 里，
+ * `el-menu-item` / `el-tooltip` 在 2.14 里是空文件（样式已并入 menu / popper）。
+ * 漏写一个文件不会报错，只会让对应组件掉样式，所以新增组件时要成对补齐。 */
+@import "element-plus/theme-chalk/base.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-button.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-input.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-switch.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-tag.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-badge.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-menu.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-alert.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-skeleton.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-skeleton-item.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-descriptions.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-descriptions-item.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-progress.css" layer(element-plus);
+@import "element-plus/theme-chalk/el-popper.css" layer(element-plus);
+
+@import "tailwindcss/utilities.css" layer(utilities);
+
+@theme {
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+
+  /* 字号令牌：Tailwind 自带的 xs/sm 与中文说明文字的实际需求对不齐，
+   * 这里补三档紧凑字号，避免组件里反复写 text-[0.8125rem] 这类魔法值。 */
+  --text-meta: 0.8125rem; /* 13px：正文、说明、表单标签 */
+  --text-caption: 0.75rem; /* 12px：辅助信息、键位、注释 */
+  --text-micro: 0.6875rem; /* 11px：角标、极短标签 */
+  --text-title: 0.9375rem; /* 15px：卡片/区块标题 */
+
+  --color-canvas: #f5f7fb;
+  --color-surface: #ffffff;
+  --color-ink: #172033;
+  --color-ink-muted: #55627a;
+  --color-ink-subtle: #7a8497;
+  --color-line: #dfe5ef;
+  --color-line-soft: #edf1f7;
+
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-200: #c4cef0;
+  --color-brand-500: #4a68d8;
+  --color-brand-600: #3b5ccc;
+  --color-brand-700: #2f4aa3;
+
+  --color-success-50: #f2fbf5;
+  --color-success-100: #dcf3e4;
+  --color-success-600: #1c6b3a;
+  --color-warning-50: #fff8e6;
+  --color-warning-100: #fbeccb;
+  --color-warning-600: #8a5a00;
+  --color-danger-50: #fdf5f5;
+  --color-danger-100: #f8dcdc;
+  --color-danger-600: #a12222;
+
+  --radius-card: 0.875rem;
+  --shadow-card:
+    0 1px 2px rgb(23 32 51 / 0.05), 0 12px 32px rgb(23 32 51 / 0.06);
+  --shadow-panel: 0 1px 2px rgb(23 32 51 / 0.04);
+}
+
+/* Element Plus 主题变量：与上面的品牌色保持一致，避免出现两套蓝。 */
 :root {
-  color: #172033;
-  background: #ffffff;
-  font-family: Inter, system-ui, sans-serif;
+  --el-color-primary: #3b5ccc;
+  --el-color-primary-light-3: #768ddb;
+  --el-color-primary-light-5: #9daee6;
+  --el-color-primary-light-7: #c4cef0;
+  --el-color-primary-light-8: #d8def5;
+  --el-color-primary-light-9: #ebeffa;
+  --el-color-primary-dark-2: #2f4aa3;
+
+  --el-color-success: #1c6b3a;
+  --el-color-warning: #8a5a00;
+  --el-color-danger: #a12222;
+  --el-color-error: #a12222;
+  --el-color-info: #55627a;
+
+  --el-text-color-primary: #172033;
+  --el-text-color-regular: #55627a;
+  --el-text-color-secondary: #7a8497;
+  --el-text-color-placeholder: #98a1b3;
+
+  --el-border-color: #dfe5ef;
+  --el-border-color-light: #e8edf5;
+  --el-border-color-lighter: #edf1f7;
+  --el-fill-color-blank: #ffffff;
+  --el-fill-color-light: #f5f7fb;
+  --el-fill-color-lighter: #f9fafd;
+
+  --el-border-radius-base: 0.5rem;
+  --el-border-radius-small: 0.375rem;
+  --el-font-family: inherit;
+  --el-font-size-base: 0.875rem;
 }
 
-body {
-  margin: 0;
-}
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
 
-.shell {
-  max-width: 42rem;
-  margin: 0 auto;
-  padding: 4rem 1.5rem;
-}
+  body {
+    margin: 0;
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
 
-.eyebrow {
-  color: #3b5ccc;
-  font-weight: 600;
-}
+  /* 键盘可达性：Element Plus 之外的普通元素也保留统一焦点轮廓。 */
+  :focus-visible {
+    outline: 2px solid var(--color-brand-600);
+    outline-offset: 2px;
+  }
 
-.intro {
-  line-height: 1.7;
+  /* 细滚动条：桌面端内容区频繁滚动，默认滚动条过宽会挤压信息。 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background-clip: content-box;
+    background-color: #c9d2e3;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
 }

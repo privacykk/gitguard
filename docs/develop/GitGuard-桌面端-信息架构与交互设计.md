@@ -6,7 +6,7 @@
 
 目标：
 
-1. 把原先「一页同时放推送确认与仓库设置」的界面拆成可预期的导航结构，覆盖总览、身份、仓库、策略、确认、日志六块规划，以及应用设置。
+1. 把原先「一页同时放推送确认与仓库设置」的界面拆成可预期的导航结构，覆盖总览、身份、仓库、策略、确认、日志六个业务页面，以及应用设置。
 2. 导航、页面标题、菜单与快捷键全部走 i18n（`zh-CN` / `en-US`），不出现硬编码文案。
 3. 设置页可通过 macOS 通用的 `⌘,`、其它系统的 `Ctrl+,` 快速打开；原生菜单同步切换语言。
 
@@ -26,7 +26,7 @@ GitGuard
 ├── 仓库管理 Repositories
 ├── 安全策略 Policies
 ├── 推送确认 Approval
-├── 操作日志 Audit               （规划中）
+├── 操作日志 Audit
 └── 设置 Settings                （侧边栏底部，⌘, / Ctrl+,）
 ```
 
@@ -45,7 +45,7 @@ GitGuard
 | 仓库管理 | `get_settings`、`add_repository`、`toggle_repo_protection`、`@tauri-apps/plugin-dialog`      |
 | 安全策略 | `get_settings`、`set_unregistered_protection`                                                |
 | 推送确认 | `get_pending_push_request`、`confirm_push`、`cancel_push`、`push-request-received`           |
-| 操作日志 | 无（当前不持久化审计）                                                                       |
+| 操作日志 | `get_audit_log`、`build_diagnostics`、`export_diagnostics`（均只读）                         |
 | 设置     | `get_settings`、`set_confirmation_timeout`、`set_app_menu`（新增）、`open-settings` 菜单事件 |
 
 ## 3. 布局与视觉基线
@@ -116,13 +116,20 @@ GitGuard
 - 确认成功后展示「原 git push 将继续」提示并自动收起；确认失败展示稳定错误码对应的 fail-closed 文案。
 - 安全规则不变：必须手工输入 `yes`；倒计时结束、取消、未知输入都不等于确认。
 
-### 4.6 操作日志（规划中）
+### 4.6 操作日志
 
-目的：说明当前没有审计能力，避免把界面当审计凭证。
+目的：展示 CLI 写入本机的推送确认事件，并在需要排查时导出脱敏诊断摘要。
 
-- 「规划中」徽标 + 明确声明：只在 stderr 输出错误，不持久化、不上传。
-- 规划卡片：推送事件记录、配置变更记录、脱敏与导出。
-- 边界提示：当前任何页面内容都不构成审计凭证。
+- 页面标题 + 三个动作：「刷新」（`get_audit_log`）、「复制诊断摘要」（`build_diagnostics` + 剪贴板）、「导出诊断摘要」（`export_diagnostics`）；动作进行中禁用按钮，失败时展示稳定错误码对应的文案与排查建议。
+- 三张指标卡：本页事件数（最新在上，超过读取上限时只显示尾部）、无法解析而跳过的行数（只计数，不猜测内容）、保留策略（30 天 / 2000 条）。
+- 事件列表：`request_created` / `confirmed` / `cancelled` / `timeout` / `failure`，每条展示时间、结果（`pending` / `allowed` / `rejected`）、通道（终端 / 桌面端）、稳定原因码、仓库路径、远端名称与已脱敏 URL、`request_id`（终端通道没有）、ref 数。未知枚举值一律落到「未知…」文案，不猜测。
+- 审计文件卡片：只读展示 `audit.jsonl` 路径，说明与本机配置文件同目录、权限 `0600`、由 CLI 写入、桌面端不补记。
+- 空态：还没有事件，提示执行一次需要确认的 `git push` 后出现。
+- 读取失败：展示「审计文件无法读取」（`audit_unreadable`）与排查建议，不清空成「没有事件」。
+- 空态与失败都不展示伪造数据；复制 / 导出失败分别提示改用导出或重试。
+- 边界提示：「审计文件是本机普通文件，可被本机用户修改，不构成防篡改凭证；界面内容也不能代替 Git 的推送记录。」
+
+禁止：在前端推断事件结果，或把页面内容描述为审计凭证；结果与原因码只按稳定字符串映射文案。
 
 ### 4.7 设置
 
@@ -204,8 +211,8 @@ Rust：
 
 状态归属：
 
-- `App.vue` 持有 `settings`、`pending`、`busy`、`errorKey`、`confirmed` 与当前视图。
-- 页面组件只接收 props、发事件，不直接 `invoke`（仓库页的文件夹选择除外，与现状一致）。
+- `App.vue` 持有 `settings`、`pending`、`busy`、`errorCode` / `errorKey` / `errorHintKey`、`confirmed` 与当前视图。
+- 页面组件只接收 props、发事件，不直接 `invoke`（仓库页的文件夹选择、以及操作日志页的审计读取与诊断摘要除外；两者都只读，不参与放行判断）。
 
 ## 8. 测试计划
 
@@ -229,14 +236,14 @@ Rust：
 
 ## 9. 文档同步
 
-- `README.md`：页面结构、设置快捷键、身份/日志「规划中」的说明。
-- `docs/ARCHITECTURE.md`：桌面端界面结构、菜单 i18n、`open-settings` 事件与 `set_app_menu` 命令。
-- `docs/SECURITY.md`：补充「界面导航、快捷键与原生菜单不构成安全控制」的说明。
-- `AGENTS.md`：仓库地图与后端硬约束里补上菜单与页面导航的边界。
+- `README.md`：页面结构、设置快捷键、身份「规划中」与操作日志实际能力的说明。
+- `docs/ARCHITECTURE.md`：桌面端界面结构、菜单 i18n、`open-settings` 事件、`set_app_menu` 与审计命令。
+- `docs/SECURITY.md`：补充「界面导航、快捷键与原生菜单不构成安全控制」与审计不削弱 fail-closed 的说明。
+- `AGENTS.md`：仓库地图与后端硬约束里补上菜单、页面导航与审计的边界。
 
 ## 10. 实现状态
 
-已按本文落地：七个视图、`AppSidebar`（含折叠）、`components/ui` 公共组件、`navigation.ts`、`platform.ts`、`menu.rs`、`set_app_menu` 命令、`open-settings` 事件、`configPath` 字段、`zh-CN` / `en-US` 全量文案。
+已按本文落地：七个视图、`AppSidebar`（含折叠）、`components/ui` 公共组件、`navigation.ts`、`platform.ts`、`menu.rs`、`set_app_menu` 命令、`open-settings` 事件、`configPath` 字段、`zh-CN` / `en-US` 全量文案；操作日志页已由占位替换为只读审计页，数据来自 `get_audit_log`、`build_diagnostics`、`export_diagnostics`。
 
 布局：侧边栏宽度由 `AppSidebar` 的 Tailwind 类切换（`w-60` / `w-19`，即 15rem / 4.75rem），折叠状态保存在 `App.vue` 并写入 `localStorage`；内容区上限 `max-w-7xl`（80rem）并居中，卡片统一用 `CardGrid` 自适应列；Element Plus 样式按组件引入并放在 `layer(element-plus)`，Tailwind 原子类负责布局与覆盖。字号用 `text-meta` / `text-caption` / `text-micro` / `text-title` 令牌，不写任意值。
 

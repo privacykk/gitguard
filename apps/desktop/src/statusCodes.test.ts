@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  AUDIT_CHANNEL_CODES,
+  AUDIT_EVENT_CODES,
+  AUDIT_REASON_CODES,
+  AUDIT_RESULT_CODES,
   COMMAND_ERROR_CODES,
   HOOK_STATUS_CODES,
   commandErrorCode,
   isCommandErrorCode,
   isHookStatusCode,
+  toAuditChannelMessageKey,
+  toAuditEventMessageKey,
+  toAuditReasonMessageKey,
+  toAuditResultMessageKey,
+  toAuditResultTone,
+  toCommandErrorHintKey,
   toCommandErrorMessageKey,
   toHookStatusMessageKey,
 } from "./statusCodes";
@@ -49,5 +59,53 @@ describe("command error codes", () => {
     );
     expect(commandErrorCode(new Error("boom"))).toBe("unknown");
     expect(commandErrorCode(null)).toBe("unknown");
+  });
+
+  it("gives every backend error code its own next step", () => {
+    for (const code of COMMAND_ERROR_CODES) {
+      expect(toCommandErrorHintKey(code)).toBe(`errors.hints.${code}`);
+    }
+  });
+
+  it("falls back to the generic hint for unknown error codes", () => {
+    expect(toCommandErrorHintKey("email_already_taken")).toBe(
+      "errors.hints.unknown",
+    );
+    expect(toCommandErrorHintKey(undefined)).toBe("errors.hints.unknown");
+  });
+});
+
+describe("audit codes", () => {
+  it("maps every known event, result, channel and reason to its own key", () => {
+    const eventKeys = AUDIT_EVENT_CODES.map(toAuditEventMessageKey);
+    expect(new Set(eventKeys).size).toBe(AUDIT_EVENT_CODES.length);
+    expect(eventKeys.every((key) => key.startsWith("audit.events."))).toBe(
+      true,
+    );
+
+    const resultKeys = AUDIT_RESULT_CODES.map(toAuditResultMessageKey);
+    expect(new Set(resultKeys).size).toBe(AUDIT_RESULT_CODES.length);
+
+    const channelKeys = AUDIT_CHANNEL_CODES.map(toAuditChannelMessageKey);
+    expect(new Set(channelKeys).size).toBe(AUDIT_CHANNEL_CODES.length);
+
+    const reasonKeys = AUDIT_REASON_CODES.map(toAuditReasonMessageKey);
+    expect(new Set(reasonKeys).size).toBe(AUDIT_REASON_CODES.length);
+    expect(reasonKeys.every((key) => key.startsWith("audit.reasons."))).toBe(
+      true,
+    );
+  });
+
+  it("never infers an allowed result from an unknown code", () => {
+    expect(toAuditResultMessageKey("mirrored")).toBe("audit.results.unknown");
+    expect(toAuditEventMessageKey("pushed")).toBe("audit.events.unknown");
+    expect(toAuditChannelMessageKey("email")).toBe("audit.channels.unknown");
+    expect(toAuditReasonMessageKey("weird code")).toBe("audit.reasons.unknown");
+
+    expect(toAuditResultTone("allowed")).toBe("success");
+    expect(toAuditResultTone("rejected")).toBe("danger");
+    // pending 与未知结果都用警示色，绝不看起来像已放行。
+    expect(toAuditResultTone("pending")).toBe("warning");
+    expect(toAuditResultTone(null)).toBe("warning");
   });
 });

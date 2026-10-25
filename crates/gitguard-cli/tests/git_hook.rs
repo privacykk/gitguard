@@ -130,6 +130,29 @@ impl GitFixture {
         home
     }
 
+    /// 与 `gitguard-config` 相同的目录规则：macOS 用 Application Support，
+    /// 其余 Unix 用配置目录（受 XDG_CONFIG_HOME 控制）。
+    fn config_dir(&self, home: &Path) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/dev.gitguard.desktop")
+        } else {
+            home.join(".config/gitguard")
+        }
+    }
+
+    /// 审计文件与被测进程使用同一目录。
+    fn audit_path(&self, home: &Path) -> PathBuf {
+        self.config_dir(home).join("audit.jsonl")
+    }
+
+    /// 读取隔离 HOME 下写出的审计事件；坏行直接跳过。
+    fn audit_events(&self, home: &Path) -> Vec<serde_json::Value> {
+        let text = fs::read_to_string(self.audit_path(home)).unwrap_or_default();
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
     /// 在隔离的 HOME 下写入 GitGuard 配置，决定这个仓库是否启用推送确认。
     fn write_config(&self, home: &Path, enabled: bool) {
         self.write_config_with_id(home, REGISTERED_REPOSITORY_ID, enabled);
@@ -141,13 +164,7 @@ impl GitFixture {
             .work
             .canonicalize()
             .expect("canonicalize work repository");
-        // 与 `gitguard-config` 相同的目录规则：macOS 用 Application Support，
-        // 其余 Unix 用配置目录（受 XDG_CONFIG_HOME 控制）。
-        let config_dir = if cfg!(target_os = "macos") {
-            home.join("Library/Application Support/dev.gitguard.desktop")
-        } else {
-            home.join(".config/gitguard")
-        };
+        let config_dir = self.config_dir(home);
         fs::create_dir_all(&config_dir).expect("create config directory");
 
         let config = serde_json::json!({
@@ -425,6 +442,97 @@ fn real_mode_exits_with_ipc_error_when_no_desktop_app_is_running() {
 }
 
 #[test]
+fn real_mode_writes_redacted_audit_events_when_ipc_fails() {
+    // 请求创建与最终失败都要落盘；remote URL 里的凭据不得进入审计文件。
+    let fixture = GitFixture::new();
+    let home = fixture.isolated_home();
+    fixture.write_config(&home, true);
+    let local = String::from_utf8(git(&fixture.work, &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 oid")
+        .trim()
+        .to_owned();
+    let stdin = format!(
+        "refs/heads/main {local} refs/heads/main {}\n",
+        "0".repeat(40)
+    );
+
+    let output = fixture.run_cli(
+        &home,
+        &[
+            "hook",
+            "pre-push",
+            "--repository-id",
+            REGISTERED_REPOSITORY_ID,
+            "origin",
+            "https://user:super-secret@example.com/team/repo.git",
+        ],
+        &stdin,
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "IPC 失败仍应固定退出码 7: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = fixture.audit_events(&home);
+    assert_eq!(events.len(), 2, "应记录请求创建与失败两条事件: {events:?}");
+    assert_eq!(events[0]["event"], "request_created");
+    assert_eq!(events[0]["result"], "pending");
+    assert_eq!(events[0]["channel"], "desktop");
+    assert_eq!(events[0]["reason_code"], "confirmation_required");
+    assert_eq!(events[0]["repository_id"], REGISTERED_REPOSITORY_ID);
+    assert_eq!(events[1]["event"], "failure");
+    assert_eq!(events[1]["result"], "rejected");
+    assert_eq!(events[1]["reason_code"], "ipc_unavailable");
+    assert_eq!(
+        events[0]["remote_url"],
+        "https://***@example.com/team/repo.git"
+    );
+
+    let raw = fs::read_to_string(fixture.audit_path(&home)).expect("read audit log");
+    assert!(!raw.contains("super-secret"), "审计文件不得包含密码: {raw}");
+}
+
+#[test]
+fn audit_write_failure_does_not_change_the_exit_code() {
+    // 审计写入失败只能记录错误，不能把「拒绝」改成「放行」，也不能改写退出码。
+    let fixture = GitFixture::new();
+    let home = fixture.isolated_home();
+    fixture.write_config(&home, true);
+    // 用同名目录占住审计文件，追加一定失败。
+    fs::create_dir_all(fixture.audit_path(&home)).expect("create blocking directory");
+
+    let local = String::from_utf8(git(&fixture.work, &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 oid")
+        .trim()
+        .to_owned();
+    let stdin = format!(
+        "refs/heads/main {local} refs/heads/main {}\n",
+        "0".repeat(40)
+    );
+    let output = fixture.run_cli(
+        &home,
+        &["hook", "pre-push", "origin", "file:///tmp/remote.git"],
+        &stdin,
+        &[],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "审计失败不得改变推送结果: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not write the audit record"),
+        "应只写一行审计错误提示: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn real_mode_blocks_push_when_the_desktop_app_is_not_running() {
     // 端到端：Hook 拦截 → IPC 失败 → Git 终止 push，且远端 ref 从未被创建。
     let fixture = GitFixture::new();
@@ -640,6 +748,21 @@ fn confirmed_non_fast_forward_update_exits_zero_without_pushing() {
     assert_eq!(
         fixture.remote_oid("refs/heads/main"),
         format!("{remote}\n").as_bytes()
+    );
+
+    // 确认路径同样要落盘：请求创建 + 用户确认（allowed）。
+    let events = fixture.audit_events(home);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "request_created"),
+        "应记录请求创建: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "confirmed" && event["result"] == "allowed"),
+        "应记录确认与放行结果: {events:?}"
     );
 
     drop(server);

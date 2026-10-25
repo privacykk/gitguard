@@ -40,6 +40,34 @@ const SETTINGS = {
   configPath: "/tmp/gitguard/config.json",
 };
 
+/** 一条已脱敏的审计事件，字段名与 Rust 视图的 camelCase 一致。 */
+const AUDIT_EVENT = {
+  timestampEpochSecs: 1_790_000_000,
+  timestamp: "2026-09-21T14:13:20Z",
+  event: "confirmed",
+  result: "allowed",
+  reasonCode: "user_confirmed",
+  channel: "desktop",
+  repositoryPath: "/tmp/example",
+  repositoryId: "repo-1",
+  remoteName: "origin",
+  remoteUrl: "https://***@example.com/team/example.git",
+  requestId: "request-1",
+  refCount: 1,
+};
+
+const AUDIT_LOG = {
+  path: "/tmp/gitguard/audit.jsonl",
+  retentionDays: 30,
+  maxEntries: 2000,
+  events: [AUDIT_EVENT],
+  skippedLines: 1,
+  truncated: false,
+  loadError: null,
+  configError: null,
+  ipcError: null,
+};
+
 /** 每次调用都重新构造，避免测试之间共享可变对象。 */
 function confirmationRequest() {
   return {
@@ -75,6 +103,14 @@ function defaultInvoke(command: string): Promise<unknown> {
       return Promise.resolve(null);
     case "get_settings":
       return Promise.resolve(SETTINGS);
+    case "get_audit_log":
+      return Promise.resolve(AUDIT_LOG);
+    case "build_diagnostics":
+      return Promise.resolve(
+        "gitguard diagnostics\ngenerated_at: 2026-10-25T00:00:00Z\n",
+      );
+    case "export_diagnostics":
+      return Promise.resolve("/tmp/gitguard/diagnostics-1.txt");
     case "confirm_push":
       return Promise.resolve(null);
     case "cancel_push":
@@ -144,6 +180,7 @@ describe("App", () => {
     wrapper?.unmount();
     wrapper = null;
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+    Reflect.deleteProperty(window.navigator, "clipboard");
     vi.unstubAllGlobals();
     setLocale(DEFAULT_LOCALE);
   });
@@ -196,7 +233,7 @@ describe("App", () => {
     expect(app.text()).toContain(i18n.global.t("hookStatus.unknown"));
   });
 
-  it("marks identity and audit pages as planned instead of pretending they work", async () => {
+  it("marks the identity page as planned instead of pretending it works", async () => {
     const app = mountApp();
     await flushPromises();
 
@@ -205,10 +242,60 @@ describe("App", () => {
       i18n.global.t("identities.title"),
     );
     expect(app.text()).toContain(i18n.global.t("identities.unavailableTitle"));
+  });
 
+  it("shows an empty audit page before any push is confirmed", async () => {
+    mocks.invoke.mockImplementation((command: string) =>
+      command === "get_audit_log"
+        ? Promise.resolve({ ...AUDIT_LOG, events: [], skippedLines: 0 })
+        : defaultInvoke(command),
+    );
+
+    const app = mountApp();
+    await flushPromises();
     await openView(app, "audit");
+
     expect(app.get("#audit-title").text()).toBe(i18n.global.t("audit.title"));
-    expect(app.text()).toContain(i18n.global.t("audit.unavailableTitle"));
+    expect(app.text()).toContain(i18n.global.t("audit.emptyTitle"));
+    expect(app.text()).toContain(AUDIT_LOG.path);
+    // 审计文件不是防篡改凭证，页面必须一直说明这个边界。
+    expect(app.text()).toContain(i18n.global.t("audit.boundary"));
+    expect(app.findAll("[data-audit-event]")).toHaveLength(0);
+  });
+
+  it("renders audit events and copies a redacted diagnostics summary", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(window.navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const app = mountApp();
+    await flushPromises();
+    await openView(app, "audit");
+
+    const events = app.findAll("[data-audit-event]");
+    expect(events).toHaveLength(1);
+    expect(events[0].text()).toContain(i18n.global.t("audit.events.confirmed"));
+    expect(events[0].text()).toContain(
+      i18n.global.t("audit.reasons.user_confirmed"),
+    );
+    expect(events[0].text()).toContain(i18n.global.t("audit.results.allowed"));
+    expect(events[0].text()).toContain(AUDIT_EVENT.remoteUrl);
+
+    await app.get("[data-audit-copy]").trigger("click");
+    await flushPromises();
+
+    // 诊断摘要必须由后端生成，前端只负责复制。
+    expect(mocks.invoke).toHaveBeenCalledWith("build_diagnostics", {
+      lastErrorCode: null,
+    });
+    expect(writeText).toHaveBeenCalledWith(
+      expect.stringContaining("gitguard diagnostics"),
+    );
+    expect(app.get("[data-audit-action-notice]").text()).toContain(
+      i18n.global.t("audit.copied"),
+    );
   });
 
   it("stays read-only when the desktop backend is unavailable", async () => {

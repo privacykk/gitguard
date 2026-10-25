@@ -11,6 +11,7 @@ gitguard-policy.workspace = true
 gitguard-config.workspace = true
 gitguard-ipc.workspace = true
 gitguard-git.workspace = true
+gitguard-audit.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

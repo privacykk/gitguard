@@ -19,9 +19,10 @@
 mod terminal;
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gitguard_audit::{reason, AuditChannel, AuditEventKind, AuditResult, AuditSubject};
 use gitguard_config::PushConfirmationState;
 use gitguard_core::{
     CliExitCode, ConfirmationDecision, Decision, GitGuardError, PushConfirmationRequest, RefUpdate,
@@ -45,6 +46,69 @@ enum Outcome {
     AllowAfterConfirmation,
     /// 明确拒绝。
     Reject(CliExitCode),
+}
+
+/// 一次推送的审计上下文。
+///
+/// 只负责记录，不参与任何判定：写失败只往 `stderr` 加一行提示，
+/// 当前的 `Outcome` 与退出码保持不变。审计目录不可用时同样只提示一次。
+struct AuditTrail {
+    subject: AuditSubject,
+    path: Option<PathBuf>,
+}
+
+impl AuditTrail {
+    fn new(repo_key: &str, args: &HookArgs, updates: &[RefUpdate]) -> Self {
+        let path = gitguard_config::config_dir()
+            .ok()
+            .map(|dir| gitguard_audit::audit_file_path(&dir));
+        Self {
+            subject: AuditSubject::new(
+                repo_key,
+                args.repository_id.as_deref(),
+                args.remote_name.as_deref().unwrap_or_default(),
+                args.remote_url.as_deref().unwrap_or_default(),
+                updates.len(),
+            ),
+            path,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// 追加一条事件；写入与保留清理失败都只记录错误，不改变推送结果。
+    fn record<W: Write>(
+        &self,
+        stderr: &mut W,
+        event: AuditEventKind,
+        result: AuditResult,
+        reason_code: &str,
+        request_id: Option<&str>,
+        channel: AuditChannel,
+    ) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let timestamp = now_epoch_secs();
+        let record = self
+            .subject
+            .event(timestamp, event, result, reason_code, request_id, channel);
+        if let Err(error) = gitguard_audit::append_event_to(path, &record) {
+            let _ = writeln!(
+                stderr,
+                "gitguard: could not write the audit record: {error}"
+            );
+            return;
+        }
+        if let Err(error) = gitguard_audit::enforce_retention_at(path, timestamp) {
+            let _ = writeln!(
+                stderr,
+                "gitguard: could not apply the audit retention policy: {error}"
+            );
+        }
+    }
 }
 
 /// 进程入口：把执行结果统一转换成退出码，并保证错误只写 `stderr`。
@@ -157,40 +221,254 @@ fn request_confirmation<W: Write>(
             .max(MIN_CONFIRMATION_TIMEOUT_SECS),
     );
 
+    let audit = AuditTrail::new(repo_key, args, updates);
+    if !audit.is_enabled() {
+        let _ = writeln!(
+            stderr,
+            "gitguard: the audit log location is unavailable; the push decision is unaffected"
+        );
+    }
+
     // 1) 有控制终端：在终端里确认，桌面端不参与本次请求。
-    if let Some(outcome) = confirm_in_terminal(&repo_path, args, updates, timeout)? {
-        return Ok(outcome);
+    if terminal::is_available() {
+        audit.record(
+            stderr,
+            AuditEventKind::RequestCreated,
+            AuditResult::Pending,
+            reason::CONFIRMATION_REQUIRED,
+            None,
+            AuditChannel::Terminal,
+        );
+
+        // 列提交失败与其它错误需要区分原因码，因此单独记录预览是否抛错。
+        let mut preview_failed = false;
+        let decision = terminal::confirm_with(
+            || match build_terminal_preview(&repo_path, args, updates) {
+                Ok(preview) => Ok(preview),
+                Err(error) => {
+                    preview_failed = true;
+                    Err(error)
+                }
+            },
+            timeout,
+        );
+
+        match decision {
+            Err(error) => {
+                let reason_code = if preview_failed {
+                    reason::COMMIT_LIST_UNAVAILABLE
+                } else {
+                    reason_for_error(&error)
+                };
+                audit.record(
+                    stderr,
+                    AuditEventKind::Failure,
+                    AuditResult::Rejected,
+                    reason_code,
+                    None,
+                    AuditChannel::Terminal,
+                );
+                return Err(error);
+            }
+            Ok(Some(terminal::Decision::Confirmed)) => {
+                // 确认与真正推送之间还有时间差，必须确认 ref 没有被移走。
+                if let Err(error) = gitguard_git::verify_push_preconditions(&repo_path, updates) {
+                    audit.record(
+                        stderr,
+                        AuditEventKind::Failure,
+                        AuditResult::Rejected,
+                        reason::REFS_CHANGED,
+                        None,
+                        AuditChannel::Terminal,
+                    );
+                    return Err(error);
+                }
+                audit.record(
+                    stderr,
+                    AuditEventKind::Confirmed,
+                    AuditResult::Allowed,
+                    reason::USER_CONFIRMED,
+                    None,
+                    AuditChannel::Terminal,
+                );
+                return Ok(Outcome::AllowAfterConfirmation);
+            }
+            // 取消与超时都是明确的不确认，一律按拒绝处理。
+            Ok(Some(terminal::Decision::Declined)) => {
+                audit.record(
+                    stderr,
+                    AuditEventKind::Cancelled,
+                    AuditResult::Rejected,
+                    reason::USER_CANCELLED,
+                    None,
+                    AuditChannel::Terminal,
+                );
+                return Ok(Outcome::Reject(CliExitCode::Denied));
+            }
+            Ok(Some(terminal::Decision::TimedOut)) => {
+                audit.record(
+                    stderr,
+                    AuditEventKind::Timeout,
+                    AuditResult::Rejected,
+                    reason::CONFIRMATION_TIMEOUT,
+                    None,
+                    AuditChannel::Terminal,
+                );
+                return Ok(Outcome::Reject(CliExitCode::Denied));
+            }
+            // 二次判断时终端消失：记录一次通道失败，然后照常降级到桌面端。
+            Ok(None) => {
+                audit.record(
+                    stderr,
+                    AuditEventKind::Failure,
+                    AuditResult::Pending,
+                    reason::TERMINAL_UNAVAILABLE,
+                    None,
+                    AuditChannel::Terminal,
+                );
+            }
+        }
     }
 
     // 2) 没有控制终端（图形客户端、CI）：请求桌面端确认。
-    confirm_in_desktop(&repo_path, args, updates, timeout, stderr)
-}
+    let request = PushConfirmationRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        repository_path: path_to_key(&repo_path)?.to_string(),
+        remote_name: args.remote_name.clone().unwrap_or_default(),
+        remote_url: args.remote_url.clone().unwrap_or_default(),
+        ref_updates: updates.to_vec(),
+        timestamp_epoch_secs: now_epoch_secs(),
+    };
+    let request_id = request.request_id.clone();
+    audit.record(
+        stderr,
+        AuditEventKind::RequestCreated,
+        AuditResult::Pending,
+        reason::CONFIRMATION_REQUIRED,
+        Some(&request_id),
+        AuditChannel::Desktop,
+    );
 
-/// 在控制终端里展示本次推送并等待用户输入。
-///
-/// 返回 `Ok(None)` 表示当前进程没有控制终端，调用方应降级到桌面端确认。
-fn confirm_in_terminal(
-    repo_path: &Path,
-    args: &HookArgs,
-    updates: &[RefUpdate],
-    timeout: Duration,
-) -> gitguard_core::Result<Option<Outcome>> {
-    let decision =
-        terminal::confirm_with(|| build_terminal_preview(repo_path, args, updates), timeout)?;
-    let Some(decision) = decision else {
-        return Ok(None);
+    // 图形客户端只能在输出面板里看到这行提示，否则用户不知道卡在哪里。
+    let _ = writeln!(
+        stderr,
+        "gitguard: waiting for confirmation in the GitGuard desktop app (timeout {timeout:?})"
+    );
+
+    let socket_path = match gitguard_ipc::default_socket_path() {
+        Ok(path) => path,
+        Err(error) => {
+            audit.record(
+                stderr,
+                AuditEventKind::Failure,
+                AuditResult::Rejected,
+                reason::IPC_UNAVAILABLE,
+                Some(&request_id),
+                AuditChannel::Desktop,
+            );
+            return Err(error);
+        }
     };
 
-    match decision {
-        terminal::Decision::Confirmed => {
-            // 确认与真正推送之间还有时间差，必须确认 ref 没有被移走。
-            gitguard_git::verify_push_preconditions(repo_path, updates)?;
-            Ok(Some(Outcome::AllowAfterConfirmation))
+    let response = match gitguard_ipc::send_confirmation_request(&socket_path, &request, timeout) {
+        Ok(response) => response,
+        Err(error) => {
+            audit.record(
+                stderr,
+                AuditEventKind::Failure,
+                AuditResult::Rejected,
+                reason::IPC_UNAVAILABLE,
+                Some(&request_id),
+                AuditChannel::Desktop,
+            );
+            return Err(error);
         }
-        // 取消与超时都是明确的不确认，一律按拒绝处理。
-        terminal::Decision::Declined | terminal::Decision::TimedOut => {
-            Ok(Some(Outcome::Reject(CliExitCode::Denied)))
+    };
+
+    // 响应必须对得上本次请求；对不上说明串了会话，按 IPC 失败处理。
+    if response.request_id != request.request_id {
+        audit.record(
+            stderr,
+            AuditEventKind::Failure,
+            AuditResult::Rejected,
+            reason::REQUEST_MISMATCH,
+            Some(&request_id),
+            AuditChannel::Desktop,
+        );
+        return Err(GitGuardError::IpcError(
+            "the desktop app returned a response for a different request".into(),
+        ));
+    }
+
+    match response.decision {
+        ConfirmationDecision::Confirmed => {
+            // 真正执行推送的是原始 git push，放行前再校验一次 ref。
+            if let Err(error) = gitguard_git::verify_push_preconditions(&repo_path, updates) {
+                audit.record(
+                    stderr,
+                    AuditEventKind::Failure,
+                    AuditResult::Rejected,
+                    reason::REFS_CHANGED,
+                    Some(&request_id),
+                    AuditChannel::Desktop,
+                );
+                return Err(error);
+            }
+            audit.record(
+                stderr,
+                AuditEventKind::Confirmed,
+                AuditResult::Allowed,
+                reason::USER_CONFIRMED,
+                Some(&request_id),
+                AuditChannel::Desktop,
+            );
+            Ok(Outcome::AllowAfterConfirmation)
         }
+        ConfirmationDecision::Cancelled => {
+            audit.record(
+                stderr,
+                AuditEventKind::Cancelled,
+                AuditResult::Rejected,
+                reason::USER_CANCELLED,
+                Some(&request_id),
+                AuditChannel::Desktop,
+            );
+            Ok(Outcome::Reject(CliExitCode::Denied))
+        }
+        ConfirmationDecision::Timeout => {
+            audit.record(
+                stderr,
+                AuditEventKind::Timeout,
+                AuditResult::Rejected,
+                reason::CONFIRMATION_TIMEOUT,
+                Some(&request_id),
+                AuditChannel::Desktop,
+            );
+            Ok(Outcome::Reject(CliExitCode::Denied))
+        }
+        // 取消、超时、内部错误一律按拒绝处理。
+        ConfirmationDecision::Error => {
+            audit.record(
+                stderr,
+                AuditEventKind::Failure,
+                AuditResult::Rejected,
+                reason::CONFIRMATION_FAILED,
+                Some(&request_id),
+                AuditChannel::Desktop,
+            );
+            Ok(Outcome::Reject(CliExitCode::Denied))
+        }
+    }
+}
+
+/// 把错误类型映射成审计原因码；只用于说明失败原因，不参与判定。
+fn reason_for_error(error: &GitGuardError) -> &'static str {
+    match error {
+        GitGuardError::InvalidInput(_) => reason::INVALID_INPUT,
+        GitGuardError::PolicyUnavailable(_) => reason::POLICY_UNAVAILABLE,
+        GitGuardError::Io(_) => reason::IO_ERROR,
+        GitGuardError::Internal(_) => reason::INTERNAL_ERROR,
+        GitGuardError::IpcError(_) => reason::IPC_UNAVAILABLE,
     }
 }
 
@@ -231,52 +509,6 @@ fn build_terminal_preview(
         remote_url: args.remote_url.clone().unwrap_or_default(),
         refs,
     })
-}
-
-/// 没有控制终端时，把请求交给桌面端，等待用户在桌面端确认。
-fn confirm_in_desktop<W: Write>(
-    repo_path: &Path,
-    args: &HookArgs,
-    updates: &[RefUpdate],
-    timeout: Duration,
-    stderr: &mut W,
-) -> gitguard_core::Result<Outcome> {
-    let request = PushConfirmationRequest {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        repository_path: path_to_key(repo_path)?.to_string(),
-        remote_name: args.remote_name.clone().unwrap_or_default(),
-        remote_url: args.remote_url.clone().unwrap_or_default(),
-        ref_updates: updates.to_vec(),
-        timestamp_epoch_secs: now_epoch_secs(),
-    };
-
-    // 图形客户端只能在输出面板里看到这行提示，否则用户不知道卡在哪里。
-    let _ = writeln!(
-        stderr,
-        "gitguard: waiting for confirmation in the GitGuard desktop app (timeout {timeout:?})"
-    );
-
-    let socket_path = gitguard_ipc::default_socket_path()?;
-    let response = gitguard_ipc::send_confirmation_request(&socket_path, &request, timeout)?;
-
-    // 响应必须对得上本次请求；对不上说明串了会话，按 IPC 失败处理。
-    if response.request_id != request.request_id {
-        return Err(GitGuardError::IpcError(
-            "the desktop app returned a response for a different request".into(),
-        ));
-    }
-
-    match response.decision {
-        ConfirmationDecision::Confirmed => {
-            // 真正执行推送的是原始 git push，放行前再校验一次 ref。
-            gitguard_git::verify_push_preconditions(repo_path, updates)?;
-            Ok(Outcome::AllowAfterConfirmation)
-        }
-        // 取消、超时、内部错误一律按拒绝处理。
-        ConfirmationDecision::Cancelled
-        | ConfirmationDecision::Timeout
-        | ConfirmationDecision::Error => Ok(Outcome::Reject(CliExitCode::Denied)),
-    }
 }
 
 /// 把仓库路径转成配置里使用的字符串键。

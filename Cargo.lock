@@ -1093,9 +1093,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitguard-audit"
+version = "0.1.0"
+dependencies = [
+ "gitguard-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "gitguard-cli"
 version = "0.1.0"
 dependencies = [
+ "gitguard-audit",
  "gitguard-config",
  "gitguard-core",
  "gitguard-git",
@@ -1130,6 +1141,7 @@ dependencies = [
 name = "gitguard-desktop"
 version = "0.1.0"
 dependencies = [
+ "gitguard-audit",
  "gitguard-config",
  "gitguard-core",
  "gitguard-git",

@@ -18,6 +18,7 @@ gitguard-config.workspace = true
 gitguard-ipc.workspace = true
 gitguard-git.workspace = true
 gitguard-hook.workspace = true
+gitguard-audit.workspace = true
 serde.workspace = true
 # 仓库 id：写进 Hook 脚本，CLI 用它把 Hook 与配置记录对应起来。
 uuid.workspace = true

@@ -8,9 +8,11 @@
 import { computed } from "vue";
 
 const props = defineProps<{
-    type: "info" | "success" | "warning" | "error";
-    title?: string;
-    description?: string;
+  type: "info" | "success" | "warning" | "error";
+  title?: string;
+  description?: string;
+  /** 排查建议：只提示下一步该看什么，不改变任何状态。 */
+  hint?: string;
 }>();
 
 const role = computed(() => (props.type === "error" ? "alert" : "status"));
@@ -23,16 +25,27 @@ const role = computed(() => (props.type === "error" ? "alert" : "status"));
     :closable="false"
     show-icon
     :role="role"
-    class="!items-start rounded-lg"
+    class="items-start! rounded-lg"
   >
     <template
-      v-if="description || $slots.action"
+      v-if="description || hint || $slots.action"
       #default
     >
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <span class="text-meta leading-relaxed">
-          {{ description }}
-        </span>
+        <div class="min-w-0 space-y-1">
+          <span
+            v-if="description"
+            class="block text-meta leading-relaxed"
+          >
+            {{ description }}
+          </span>
+          <p
+            v-if="hint"
+            class="m-0 text-caption leading-relaxed opacity-80"
+          >
+            {{ hint }}
+          </p>
+        </div>
         <slot name="action" />
       </div>
     </template>

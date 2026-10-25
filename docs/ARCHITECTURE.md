@@ -7,11 +7,12 @@ Vue 3 UI（apps/desktop/src）
   ↓ invoke / event
 Tauri commands（apps/desktop/src-tauri）
   ↓
-gitguard-hook / gitguard-git / gitguard-config / gitguard-ipc → gitguard-core
+gitguard-hook / gitguard-git / gitguard-config / gitguard-ipc / gitguard-audit → gitguard-core
 
 Git pre-push Hook（shell 脚本）
   ↓
 gitguard-cli ──┬→ gitguard-policy → gitguard-core        （--policy 调试模式）
+               ├→ gitguard-audit → gitguard-core        （审计写入，失败不改结果）
                └→ gitguard-config / gitguard-git / gitguard-ipc
 
 gitguard-cli ── Unix Domain Socket ── Tauri commands
@@ -24,21 +25,23 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 - `gitguard-git` 是唯一执行 Git 的地方，统一使用 `Command` 参数数组、`GIT_TERMINAL_PROMPT=0`，外部输入先校验再交给 Git；祖先关系判断（`merge-base --is-ancestor`）只用于展示非快进风险。
 - `gitguard-ipc` 只搬运请求与响应，不做策略判断；通信失败一律是 `IpcError`。
 - `gitguard-hook` 只管理 Hook 文件，不判断是否允许推送，也不启动常驻进程。
+- `gitguard-audit` 只记录与展示准备：不判断策略，不执行 Git；写入失败只向上返回错误，由调用方写 `stderr`，绝不改变退出码；所有写入字段先经过脱敏。审计只由 CLI 写入、桌面端只读，避免同一次推送出现两条矛盾的记录。
 - 桌面端与前端都不实现策略：界面状态、隐藏按钮都不构成安全控制，放行决定只来自 Rust。
 
 ## 模块职责
 
-| 模块                     | 职责                                                                                                                                |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `gitguard-core`          | `Decision`、`PolicyResult`、`RefUpdate`、`PushConfirmationRequest/Response`、`ConfirmationDecision`、`GitGuardError`、`CliExitCode` |
-| `gitguard-policy`        | 原型策略 `evaluate`，供 `--policy` 调试模式使用                                                                                     |
-| `gitguard-config`        | 本地 JSON 配置读写（全局默认值、仓库登记与开关、Hook 状态），原子写入；损坏时不覆盖                                                 |
-| `gitguard-git`           | 仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断（`Command` 参数数组，不做策略）                                           |
-| `gitguard-ipc`           | Unix Domain Socket 服务端与客户端、JSON + 换行协议、超时、socket 权限 `0600`                                                        |
-| `gitguard-hook`          | `pre-push` Hook 的安装、卸载、备份链式调用与健康检查；把仓库 id 写进脚本供 CLI 对上配置记录                                         |
-| `gitguard-cli`           | 参数校验、读取 stdin、逐行解析 ref、按仓库 id / 路径 / 全局开关判定、选择通道、确认后重新校验 ref、退出码映射（bin：`gitguard`）    |
-| `apps/desktop/src-tauri` | `AppState`（配置 + 待确认请求 + IPC 错误）、IPC 服务端、Tauri commands、原生菜单构建；确认时只回 `Confirmed`，不执行 Git            |
-| `apps/desktop/src`       | Vue 界面、页面导航与 i18n 语言包、状态码到文案的映射、`components/ui` 公共展示组件；只做展示与交互                                  |
+| 模块                     | 职责                                                                                                                                                        |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gitguard-core`          | `Decision`、`PolicyResult`、`RefUpdate`、`PushConfirmationRequest/Response`、`ConfirmationDecision`、`GitGuardError`、`CliExitCode`                         |
+| `gitguard-policy`        | 原型策略 `evaluate`，供 `--policy` 调试模式使用                                                                                                             |
+| `gitguard-config`        | 本地 JSON 配置读写（全局默认值、仓库登记与开关、Hook 状态），原子写入；损坏时不覆盖                                                                         |
+| `gitguard-git`           | 仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断（`Command` 参数数组，不做策略）                                                                   |
+| `gitguard-ipc`           | Unix Domain Socket 服务端与客户端、JSON + 换行协议、超时、socket 权限 `0600`                                                                                |
+| `gitguard-hook`          | `pre-push` Hook 的安装、卸载、备份链式调用与健康检查；把仓库 id 写进脚本供 CLI 对上配置记录                                                                 |
+| `gitguard-audit`         | 审计事件模型（请求/结果/原因码/通道）、统一脱敏（URL、Token、私钥、控制字符）、JSONL 追加与保留清理、诊断摘要渲染与导出                                     |
+| `gitguard-cli`           | 参数校验、读取 stdin、逐行解析 ref、按仓库 id / 路径 / 全局开关判定、选择通道、确认后重新校验 ref、写审计事件、退出码映射（bin：`gitguard`）                |
+| `apps/desktop/src-tauri` | `AppState`（配置 + 待确认请求 + IPC 错误 + 审计路径）、IPC 服务端、Tauri commands（含审计读取与诊断导出）、原生菜单构建；确认时只回 `Confirmed`，不执行 Git |
+| `apps/desktop/src`       | Vue 界面、页面导航与 i18n 语言包、状态码到文案的映射、`components/ui` 公共展示组件；只做展示与交互                                                          |
 
 ## 桌面端界面结构
 
@@ -51,15 +54,15 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 - 这些组件只影响外观：状态色由 `statusCodes.ts` 的白名单映射给出，未知状态一律用警示色；组件不判断是否放行。
 - 字号与颜色一样走令牌：`text-meta`（13px）、`text-caption`（12px）、`text-micro`（11px）、`text-title`（15px）定义在 `@theme`，组件不写任意值。`src/shims-vue.d.ts` 只是给不识别 `.vue` 的语言服务兜底的默认导出声明，不参与运行时，以 `vue-tsc` 的推导为准；工作区用 `.vscode/settings.json` 关掉 Vetur 校验，避免与 Volar 重复报错。
 
-| 视图               | 数据来源                                                       | 边界                                                              |
-| ------------------ | -------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `DashboardView`    | `get_settings`、待确认请求、Hook 健康状态                      | 只汇总展示；未知 Hook 状态计入「异常」而不是「正常」              |
-| `IdentitiesView`   | 无                                                             | 占位页：后端尚无身份能力，只说明规划与边界                        |
-| `RepositoriesView` | `add_repository`、`toggle_repo_protection`、`open`（目录选择） | 目录选择返回值不被信任，一律在 Rust 侧重新校验                    |
-| `PoliciesView`     | `set_unregistered_protection`、`get_settings`                  | 只管全局默认值；判定顺序仍在 CLI 侧，界面不实现策略               |
-| `ApprovalView`     | 待确认请求、`confirm_push` / `cancel_push`                     | 复用 `PushConfirmation`；`requestId` 作 key，新请求清空已输入内容 |
-| `AuditView`        | 无                                                             | 占位页：尚无审计日志能力，不展示伪造数据                          |
-| `SettingsView`     | `get_settings`、`set_confirmation_timeout`、`set_app_menu`     | 超时只做格式校验，越界由后端拒绝；语言切换不改变任何放行决定      |
+| 视图               | 数据来源                                                       | 边界                                                                |
+| ------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `DashboardView`    | `get_settings`、待确认请求、Hook 健康状态                      | 只汇总展示；未知 Hook 状态计入「异常」而不是「正常」                |
+| `IdentitiesView`   | 无                                                             | 占位页：后端尚无身份能力，只说明规划与边界                          |
+| `RepositoriesView` | `add_repository`、`toggle_repo_protection`、`open`（目录选择） | 目录选择返回值不被信任，一律在 Rust 侧重新校验                      |
+| `PoliciesView`     | `set_unregistered_protection`、`get_settings`                  | 只管全局默认值；判定顺序仍在 CLI 侧，界面不实现策略                 |
+| `ApprovalView`     | 待确认请求、`confirm_push` / `cancel_push`                     | 复用 `PushConfirmation`；`requestId` 作 key，新请求清空已输入内容   |
+| `AuditView`        | `get_audit_log`、`build_diagnostics`、`export_diagnostics`     | 只读展示 CLI 写入的事件；页面内容不构成审计凭证，不参与任何放行判断 |
+| `SettingsView`     | `get_settings`、`set_confirmation_timeout`、`set_app_menu`     | 超时只做格式校验，越界由后端拒绝；语言切换不改变任何放行决定        |
 
 导航交互：
 
@@ -124,6 +127,17 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 - 超时只清理仍匹配当前 `request_id` 的请求，不会误删更新的请求。
 - 确认只对本次请求的 ref 集合有效，不产生任何可复用的授权。
 
+## 审计与诊断
+
+- 写入方：只有 `gitguard-cli` 写审计。一次推送的请求与结果都在同一进程里，桌面端只提供读取命令（`get_audit_log`、`build_diagnostics`、`export_diagnostics`），不再补写，避免同一次推送出现两条矛盾的记录。
+- 事件类型（`AuditEventKind`）：`request_created`、`confirmed`、`cancelled`、`timeout`、`failure`；结果（`AuditResult`）：`pending`、`allowed`、`rejected`；通道（`AuditChannel`）：`terminal`、`desktop`。
+- 字段：`timestamp_epoch_secs`、`event`、`result`、`reason_code`、`channel`、`repository_path`、`repository_id`（可选）、`remote_name`、`remote_url`、`request_id`（可选）、`ref_count`。原因码是稳定契约（见 `gitguard_audit::reason`），文案可变，界面与程序只依赖这些字符串。
+- 存储：`<配置目录>/audit.jsonl`，一行一个事件，追加写，Unix 权限 `0600`。保留 30 天 / 2000 条，写完后清理一次；清理用「同目录临时文件 + rename」，没有需要删除的内容时不重写。读取只取尾部 8 MiB，丢弃截断出来的半行，坏行只计数。
+- 脱敏：所有写入与渲染字段都经过 `gitguard_audit` 的 `redact_url` / `redact_secrets` / `sanitize_text`；终端确认界面复用同一套函数，不再各自实现一份规则。
+- 失败处理：追加写或保留清理失败只往 `stderr` 写一行提示，`Outcome` 与退出码保持不变；审计不是安全边界，绝不把「写不成审计」当成拒绝或放行的理由。
+- 诊断摘要：`DiagnosticReport::render` 输出稳定 `key: value` 文本（应用版本、平台、配置 / 审计路径、配置与 IPC 错误码、仓库计数、最近 10 条事件、前端最近一次错误码）。导出写入 `<配置目录>/diagnostics-<毫秒时间戳>.txt`，目标已存在时拒绝覆盖。
+- 边界：审计文件可被本机用户修改，不构成防篡改凭证；界面内容不代替 Git 的推送记录。审计目前只覆盖推送确认，不记录配置变更。
+
 ## 配置文件与运行文件
 
 | 内容          | 位置                                                                                   |
@@ -132,6 +146,8 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 | 配置（Linux） | `$XDG_CONFIG_HOME/gitguard/config.json`（未设置时为 `~/.config/gitguard/config.json`） |
 | IPC socket    | 平台配置目录下 `dev.gitguard.desktop/gitguard.sock`（权限 `0600`）                     |
 | Hook 备份     | `<hooks 目录>/pre-push.gitguard-backup`                                                |
+| 审计日志      | 与配置文件同目录的 `audit.jsonl`（JSONL，权限 `0600`）                                 |
+| 诊断摘要      | 导出时写入配置文件同目录的 `diagnostics-<毫秒时间戳>.txt`（权限 `0600`）               |
 
 - `schema_version` 当前为 1；版本不认识或 JSON 损坏时返回错误，调用方停止写盘，绝不用默认值覆盖用户文件。
 - 写入采用「同目录临时文件 + `rename`」原子替换。
@@ -159,7 +175,8 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 ## 界面文案与状态码
 
 - Tauri command 只返回稳定错误码（如 `not_a_repository`、`hook_install_failed`）与 `HookStatus` 取值，不返回面向用户的句子。
-- 前端在 `apps/desktop/src/statusCodes.ts` 做白名单收窄；未知错误码统一渲染 fail-closed 文案，不推断推送结果。
+- 前端在 `apps/desktop/src/statusCodes.ts` 做白名单收窄；未知错误码统一渲染 fail-closed 文案，不推断推送结果；`toCommandErrorHintKey` 同时给出该码的排查建议（`errors.hints.*`）。
+- 审计字段同样先收窄：`audit.events` / `audit.results` / `audit.channels` / `audit.reasons` 只白名单命中的码才有文案，未知值落到 `unknown`，不回显原始字符串。
 - command 返回值在 `apps/desktop/src/api.ts` 做形状校验；形状不完整时按「没有待确认请求」处理，不会凭空生成可确认的界面。
 - 支持 `zh-CN` 与 `en-US`。初始语言优先级：本地记忆（`localStorage` 键 `gitguard.locale`）→ 系统语言 → `zh-CN`；切换后写回本地记忆并同步 `document.lang`。
 - 语言切换时同时调用 `set_app_menu(locale)` 重建原生菜单；`en-US` 语言包使用 `satisfies MessageSchema`，结构缺失会在 `vue-tsc` 阶段报错。
@@ -184,6 +201,7 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 ## 测试边界
 
 - 策略、Hook stdin 解析、退出码映射、配置读写、Hook 生命周期、IPC 往返、桌面端命令均有单元测试。
+- `gitguard-audit` 单测覆盖脱敏（URL、Token、私钥、控制字符）、事件序列化、保留与读取、诊断渲染与导出；CLI 集成测试在 IPC 失败与确认路径上断言审计已写出且不含凭据，并用目录占位证明写入失败不改变退出码。
 - `gitguard-git` 与 `gitguard-hook` 的测试使用 `tempfile` 临时仓库；桌面端命令测试通过注入配置路径与临时仓库隔离真实用户配置。
 - Unix 集成测试在临时工作仓库与本地 bare remote 之间真实执行 `git push`，覆盖放行、拒绝、IPC 不可用、仓库级关闭保护与「记录丢失」，并断言被拒绝时远端 ref 未变化。
 - IPC 仅实现 Unix（macOS/Linux）；Windows 需要命名管道实现，相关集成测试带 `#![cfg(unix)]` 并在 Windows 跳过。

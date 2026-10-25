@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  isAuditChannelCode,
+  isAuditEventCode,
+  isAuditResultCode,
+  type AuditChannelCode,
+  type AuditEventCode,
+  type AuditResultCode,
+} from "./statusCodes";
 
 /**
  * 与 Rust 后端之间的数据契约。
@@ -76,6 +84,38 @@ export class GitGuardCommandError extends Error {
     super(code);
     this.name = "GitGuardCommandError";
   }
+}
+
+/** 单条审计事件；审计由 CLI 写入，桌面端只读。 */
+export interface AuditEvent {
+  timestampEpochSecs: number;
+  /** 与时间戳等价的 UTC 文本，由 Rust 侧格式化。 */
+  timestamp: string;
+  event: AuditEventCode;
+  result: AuditResultCode;
+  reasonCode: string;
+  channel: AuditChannelCode;
+  repositoryPath: string;
+  repositoryId: string | null;
+  remoteName: string;
+  /** Remote URL，已由 Rust 侧隐去凭据。 */
+  remoteUrl: string;
+  requestId: string | null;
+  refCount: number;
+}
+
+/** 审计页需要的全部数据；事件按「新 → 旧」排列。 */
+export interface AuditLog {
+  path: string;
+  retentionDays: number;
+  maxEntries: number;
+  events: AuditEvent[];
+  skippedLines: number;
+  truncated: boolean;
+  /** 审计文件读取失败时的稳定错误码。 */
+  loadError: string | null;
+  configError: string | null;
+  ipcError: string | null;
 }
 
 const REF_KINDS: readonly RefKind[] = ["create", "update", "rewrite", "delete"];
@@ -240,6 +280,91 @@ function parseSettings(value: unknown): Settings | null {
   };
 }
 
+function parseAuditEvent(value: unknown): AuditEvent | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const {
+    timestampEpochSecs,
+    timestamp,
+    reasonCode,
+    repositoryPath,
+    remoteName,
+    remoteUrl,
+    refCount,
+  } = value;
+
+  if (
+    typeof timestampEpochSecs !== "number" ||
+    typeof timestamp !== "string" ||
+    typeof reasonCode !== "string" ||
+    typeof repositoryPath !== "string" ||
+    typeof remoteName !== "string" ||
+    typeof remoteUrl !== "string" ||
+    typeof refCount !== "number" ||
+    !isAuditEventCode(value.event) ||
+    !isAuditResultCode(value.result) ||
+    !isAuditChannelCode(value.channel)
+  ) {
+    return null;
+  }
+
+  return {
+    timestampEpochSecs,
+    timestamp,
+    event: value.event,
+    result: value.result,
+    reasonCode,
+    channel: value.channel,
+    repositoryPath,
+    repositoryId:
+      typeof value.repositoryId === "string" ? value.repositoryId : null,
+    remoteName,
+    remoteUrl,
+    requestId: typeof value.requestId === "string" ? value.requestId : null,
+    refCount,
+  };
+}
+
+/** 把 command 返回值收窄为审计页数据；形状不完整时返回 null（不展示猜测内容）。 */
+export function parseAuditLog(value: unknown): AuditLog | null {
+  if (!isRecord(value) || !Array.isArray(value.events)) {
+    return null;
+  }
+  const { path, retentionDays, maxEntries, skippedLines, truncated } = value;
+  if (
+    typeof path !== "string" ||
+    typeof retentionDays !== "number" ||
+    typeof maxEntries !== "number" ||
+    typeof skippedLines !== "number" ||
+    typeof truncated !== "boolean"
+  ) {
+    return null;
+  }
+
+  const events: AuditEvent[] = [];
+  for (const entry of value.events) {
+    const event = parseAuditEvent(entry);
+    if (event === null) {
+      return null;
+    }
+    events.push(event);
+  }
+
+  return {
+    path,
+    retentionDays,
+    maxEntries,
+    events,
+    skippedLines,
+    truncated,
+    loadError: typeof value.loadError === "string" ? value.loadError : null,
+    configError:
+      typeof value.configError === "string" ? value.configError : null,
+    ipcError: typeof value.ipcError === "string" ? value.ipcError : null,
+  };
+}
+
 function toCommandError(reason: unknown): GitGuardCommandError {
   if (reason instanceof GitGuardCommandError) {
     return reason;
@@ -295,6 +420,71 @@ export async function getSettings(): Promise<Settings> {
     throw new GitGuardCommandError("internal_error");
   }
   return settings;
+}
+
+/** 读取审计页数据；返回形状不对时抛 `internal_error`，不展示猜测内容。 */
+export async function getAuditLog(): Promise<AuditLog> {
+  const value = await invoke<unknown>("get_audit_log");
+  const log = parseAuditLog(value);
+  if (log === null) {
+    throw new GitGuardCommandError("internal_error");
+  }
+  return log;
+}
+
+/**
+ * 生成诊断摘要文本（已由 Rust 侧脱敏），供界面复制。
+ *
+ * `lastErrorCode` 只用于把用户刚遇到的报错与审计事件对上；
+ * 它不是句子，后端会再按字符集收窄一次。
+ */
+export async function buildDiagnostics(
+  lastErrorCode: string | null,
+): Promise<string> {
+  try {
+    const value = await invoke<unknown>("build_diagnostics", { lastErrorCode });
+    if (typeof value !== "string") {
+      throw new GitGuardCommandError("internal_error");
+    }
+    return value;
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/** 把诊断摘要导出到配置目录，返回实际路径。 */
+export async function exportDiagnostics(
+  lastErrorCode: string | null,
+): Promise<string> {
+  try {
+    const value = await invoke<unknown>("export_diagnostics", {
+      lastErrorCode,
+    });
+    if (typeof value !== "string") {
+      throw new GitGuardCommandError("internal_error");
+    }
+    return value;
+  } catch (reason) {
+    throw toCommandError(reason);
+  }
+}
+
+/**
+ * 把文本写进剪贴板；环境不允许时返回 false，由界面提示改用导出。
+ *
+ * 剪贴板不是安全控制：摘要已经由 Rust 侧脱敏，这里只做写入。
+ */
+export async function copyText(text: string): Promise<boolean> {
+  const clipboard: Clipboard | undefined = globalThis.navigator?.clipboard;
+  if (!clipboard) {
+    return false;
+  }
+  try {
+    await clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 添加仓库并安装 Hook；`enabled` 是该仓库的推送保护开关初始值。 */

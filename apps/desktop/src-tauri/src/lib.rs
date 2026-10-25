@@ -56,12 +56,22 @@ const ERROR_REQUEST_INVALID: &str = "request_invalid";
 const ERROR_INVALID_TIMEOUT: &str = "invalid_timeout";
 const ERROR_IPC_UNAVAILABLE: &str = "ipc_unavailable";
 const ERROR_INTERNAL: &str = "internal_error";
+/// 审计文件存在但无法读取（权限、路径被占用等）；界面据此提示「审计暂不可用」。
+const ERROR_AUDIT_UNREADABLE: &str = "audit_unreadable";
+/// 诊断摘要写盘失败。
+const ERROR_DIAGNOSTICS_WRITE_FAILED: &str = "diagnostics_write_failed";
 
 /// 允许的最小确认超时；0 秒等于立刻失败，对用户没有意义。
 const MIN_TIMEOUT_SECONDS: u64 = 1;
 
 /// 允许的最大确认超时（1 小时），避免配置写错导致 Hook 长时间挂住。
 const MAX_TIMEOUT_SECONDS: u64 = 3600;
+
+/// 审计页一次读取的事件条数（取最新的一批）。
+const AUDIT_PAGE_LIMIT: usize = 200;
+
+/// 诊断摘要里附带的最近事件条数。
+const DIAGNOSTIC_EVENT_LIMIT: usize = 10;
 
 /// 桌面端比 CLI 更早结束等待的余量。
 ///
@@ -143,6 +153,48 @@ struct RepositoryView {
     hook_status: HookStatus,
 }
 
+/// 审计页需要的全部数据：文件位置、保留策略与实际事件。
+///
+/// 事件按「新 → 旧」排列，前端直接渲染；审计只由 CLI 写入，这里只读。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditLogView {
+    /// 审计文件路径；界面只读展示，前端不拼接也不猜测。
+    path: String,
+    retention_days: u64,
+    max_entries: usize,
+    events: Vec<AuditEventView>,
+    /// 无法解析而被跳过的行数；只计数，不猜测内容。
+    skipped_lines: usize,
+    /// 文件超过读取上限，只展示了尾部。
+    truncated: bool,
+    /// 审计文件读取失败的稳定错误码。
+    load_error: Option<&'static str>,
+    /// 配置文件读取失败的错误码，与设置页保持一致。
+    config_error: Option<&'static str>,
+    /// IPC 服务启动失败的错误码。
+    ipc_error: Option<&'static str>,
+}
+
+/// 单条审计事件的前端形状；字段统一 camelCase，与其它视图一致。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditEventView {
+    timestamp_epoch_secs: u64,
+    /// 与时间戳等价的 UTC 文本，避免前端各自实现格式化。
+    timestamp: String,
+    event: &'static str,
+    result: &'static str,
+    reason_code: String,
+    channel: &'static str,
+    repository_path: String,
+    repository_id: Option<String>,
+    remote_name: String,
+    remote_url: String,
+    request_id: Option<String>,
+    ref_count: usize,
+}
+
 /// 等待用户决定的推送请求；确认/取消时通过 `decision_tx` 唤醒 IPC 线程。
 struct PendingPush {
     request: PushConfirmationRequest,
@@ -184,6 +236,8 @@ struct Configuration {
 /// 应用共享状态：Tauri 命令与 IPC 线程都通过它读写配置与待确认请求。
 struct AppState {
     config_path: PathBuf,
+    /// 审计文件与配置文件同目录，由 CLI 写入、这里只读。
+    audit_path: PathBuf,
     configuration: Mutex<Configuration>,
     pending: Mutex<Option<PendingPush>>,
     app_handle: Mutex<Option<AppHandle>>,
@@ -212,6 +266,28 @@ impl RepositoryView {
     }
 }
 
+impl AuditEventView {
+    /// 把存储层的枚举转成前端可翻译的稳定字符串。
+    ///
+    /// 时间文本在 Rust 侧生成：审计文件里写的是 Unix 秒，前端不自己算时区。
+    fn from_event(event: &gitguard_audit::AuditEvent) -> Self {
+        Self {
+            timestamp_epoch_secs: event.timestamp_epoch_secs,
+            timestamp: gitguard_audit::format_epoch_utc(event.timestamp_epoch_secs),
+            event: event.event.as_str(),
+            result: event.result.as_str(),
+            reason_code: event.reason_code.clone(),
+            channel: event.channel.as_str(),
+            repository_path: event.repository_path.clone(),
+            repository_id: event.repository_id.clone(),
+            remote_name: event.remote_name.clone(),
+            remote_url: event.remote_url.clone(),
+            request_id: event.request_id.clone(),
+            ref_count: event.ref_count,
+        }
+    }
+}
+
 impl AppState {
     /// 从磁盘加载配置；读取失败时使用默认值并记录错误码，
     /// 之后所有写操作都会拒绝，避免覆盖用户文件。
@@ -227,8 +303,17 @@ impl AppState {
             }
         };
 
+        // 审计文件由 CLI 写在配置目录里；拿不到父目录时退化为当前目录下的文件名，
+        // 读取会失败并映射成 `audit_unreadable`，不会影响任何推送判断。
+        let config_dir = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let audit_path = gitguard_audit::audit_file_path(&config_dir);
+
         Self {
             config_path,
+            audit_path,
             configuration: Mutex::new(Configuration { config, load_error }),
             pending: Mutex::new(None),
             app_handle: Mutex::new(None),
@@ -292,6 +377,119 @@ impl AppState {
             config_error: configuration.load_error,
             ipc_error: *lock(&self.ipc_error),
             config_path: self.config_path.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// 读取审计文件并整理成审计页数据。
+    ///
+    /// 只读不写：审计事件由 CLI 在推送时写入，这里再写会造成同一次推送出现
+    /// 两条互相矛盾的记录。读取失败只返回错误码，界面提示「暂不可用」，
+    /// 不影响任何推送判断，也绝不把「读不到」当成「没有发生过推送」。
+    fn audit_log(&self) -> AuditLogView {
+        let (config_error, ipc_error) = {
+            let configuration = lock(&self.configuration);
+            (configuration.load_error, *lock(&self.ipc_error))
+        };
+
+        let mut events = Vec::new();
+        let mut skipped_lines = 0;
+        let mut truncated = false;
+        let mut load_error = None;
+
+        match gitguard_audit::read_events_from(&self.audit_path, AUDIT_PAGE_LIMIT) {
+            Ok(tail) => {
+                // 文件按写入顺序追加（旧 → 新），界面要最新的在上面。
+                events = tail
+                    .events
+                    .iter()
+                    .rev()
+                    .map(AuditEventView::from_event)
+                    .collect();
+                skipped_lines = tail.skipped_lines;
+                truncated = tail.truncated;
+            }
+            Err(error) => {
+                eprintln!(
+                    "gitguard: could not read the audit log at {}: {error}",
+                    self.audit_path.display()
+                );
+                load_error = Some(ERROR_AUDIT_UNREADABLE);
+            }
+        }
+
+        AuditLogView {
+            path: self.audit_path.to_string_lossy().into_owned(),
+            retention_days: gitguard_audit::RETENTION_DAYS,
+            max_entries: gitguard_audit::MAX_RETENTION_ENTRIES,
+            events,
+            skipped_lines,
+            truncated,
+            load_error,
+            config_error,
+            ipc_error,
+        }
+    }
+
+    /// 组装诊断摘要所需的字段；渲染与脱敏由 `gitguard-audit` 完成。
+    ///
+    /// `last_error_code` 是前端刚看到的命令错误码，用于把「用户遇到的报错」
+    /// 与「审计里的事件」对上；它只做字符集校验，不会原样拼接。
+    fn diagnostics(&self, last_error_code: Option<&str>) -> gitguard_audit::DiagnosticReport {
+        let (repositories, protected_repositories, config_error, ipc_error) = {
+            let configuration = lock(&self.configuration);
+            (
+                configuration.config.repositories.len(),
+                configuration
+                    .config
+                    .repositories
+                    .iter()
+                    .filter(|repo| repo.push_confirmation_enabled)
+                    .count(),
+                configuration.load_error,
+                *lock(&self.ipc_error),
+            )
+        };
+
+        // 诊断要的是「总量 + 最近几条」，因此先按保留上限读完再截取尾部。
+        let (audit_entries, audit_skipped_lines, audit_error, recent_events) =
+            match gitguard_audit::read_events_from(
+                &self.audit_path,
+                gitguard_audit::MAX_RETENTION_ENTRIES,
+            ) {
+                Ok(tail) => {
+                    let entries = tail.events.len();
+                    let start = entries.saturating_sub(DIAGNOSTIC_EVENT_LIMIT);
+                    (
+                        entries,
+                        tail.skipped_lines,
+                        None,
+                        tail.events[start..].to_vec(),
+                    )
+                }
+                Err(error) => {
+                    eprintln!(
+                        "gitguard: could not read the audit log at {}: {error}",
+                        self.audit_path.display()
+                    );
+                    (0, 0, Some(ERROR_AUDIT_UNREADABLE.to_string()), Vec::new())
+                }
+            };
+
+        gitguard_audit::DiagnosticReport {
+            generated_at_epoch_secs: now_epoch_secs(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: std::env::consts::OS.to_string(),
+            config_path: self.config_path.to_string_lossy().into_owned(),
+            config_error: config_error.map(str::to_string),
+            ipc_error: ipc_error.map(str::to_string),
+            repositories,
+            protected_repositories,
+            audit_path: self.audit_path.to_string_lossy().into_owned(),
+            audit_entries,
+            audit_skipped_lines,
+            audit_error,
+            last_error_code: last_error_code.map(str::to_string),
+            recent_events,
         }
     }
 
@@ -682,6 +880,40 @@ fn cancel_push(
     }
 }
 
+/// 审计页数据；只读取 CLI 已写入的事件，不产生新记录。
+#[tauri::command]
+fn get_audit_log(state: State<'_, Arc<AppState>>) -> AuditLogView {
+    state.audit_log()
+}
+
+/// 生成诊断摘要文本（已脱敏），供前端复制到剪贴板。
+///
+/// 返回文本而不是路径：前端不需要碰文件系统，也少一条写出凭据的可能路径。
+#[tauri::command]
+fn build_diagnostics(last_error_code: Option<String>, state: State<'_, Arc<AppState>>) -> String {
+    state.diagnostics(last_error_code.as_deref()).render()
+}
+
+/// 把诊断摘要写进配置目录，返回实际路径。
+#[tauri::command]
+fn export_diagnostics(
+    last_error_code: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> std::result::Result<String, CommandError> {
+    let report = state.diagnostics(last_error_code.as_deref());
+    let config_dir = state
+        .audit_path
+        .parent()
+        .ok_or_else(|| command_error(ERROR_DIAGNOSTICS_WRITE_FAILED))?;
+
+    gitguard_audit::export_report(&report, config_dir)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| {
+            eprintln!("gitguard: could not export the diagnostics: {error}");
+            command_error(ERROR_DIAGNOSTICS_WRITE_FAILED)
+        })
+}
+
 /// 设置页数据（全局设置 + 仓库列表 + 配置/IPC 错误）。
 #[tauri::command]
 fn get_settings(state: State<'_, Arc<AppState>>) -> SettingsView {
@@ -853,6 +1085,9 @@ pub fn run() {
             get_pending_push_request,
             confirm_push,
             cancel_push,
+            get_audit_log,
+            build_diagnostics,
+            export_diagnostics,
             get_settings,
             set_app_menu,
             add_repository,
@@ -1049,6 +1284,141 @@ mod tests {
             json.get("config_path").is_none(),
             "前端不认 snake_case 字段名"
         );
+    }
+
+    /// 往临时状态的审计文件里追加一条事件，模拟 CLI 在推送时写出的记录。
+    fn append_audit_event(
+        state: &AppState,
+        subject: &gitguard_audit::AuditSubject,
+        created: u64,
+        event: gitguard_audit::AuditEventKind,
+        result: gitguard_audit::AuditResult,
+    ) {
+        let record = subject.event(
+            created,
+            event,
+            result,
+            gitguard_audit::reason::CONFIRMATION_REQUIRED,
+            None,
+            gitguard_audit::AuditChannel::Desktop,
+        );
+        gitguard_audit::append_event_to(&state.audit_path, &record).expect("append audit event");
+    }
+
+    #[test]
+    fn audit_log_is_empty_before_any_push() {
+        // 首次运行没有审计文件是正常情况，不应被渲染成错误。
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        let log = state.audit_log();
+
+        assert!(log.events.is_empty());
+        assert_eq!(log.skipped_lines, 0);
+        assert!(!log.truncated);
+        assert!(log.load_error.is_none());
+        assert!(log.path.ends_with("audit.jsonl"));
+        assert_eq!(log.retention_days, gitguard_audit::RETENTION_DAYS);
+        assert_eq!(log.max_entries, gitguard_audit::MAX_RETENTION_ENTRIES);
+    }
+
+    #[test]
+    fn audit_log_lists_newest_first_and_counts_broken_lines() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        let subject = gitguard_audit::AuditSubject::new(
+            "/tmp/example-repository",
+            Some("00000000-0000-4000-8000-000000000000"),
+            "origin",
+            "https://example.com/team/repo.git",
+            1,
+        );
+        append_audit_event(
+            &state,
+            &subject,
+            1_700_000_000,
+            gitguard_audit::AuditEventKind::RequestCreated,
+            gitguard_audit::AuditResult::Pending,
+        );
+        append_audit_event(
+            &state,
+            &subject,
+            1_700_000_010,
+            gitguard_audit::AuditEventKind::Confirmed,
+            gitguard_audit::AuditResult::Allowed,
+        );
+
+        // 被改写或截断的行只计数跳过，不能被猜成一条事件。
+        let existing = fs::read_to_string(&state.audit_path).expect("read audit log");
+        fs::write(&state.audit_path, format!("{existing}not-json\n")).expect("append broken line");
+
+        let log = state.audit_log();
+        assert_eq!(log.events.len(), 2);
+        assert_eq!(log.skipped_lines, 1);
+        assert_eq!(log.events[0].event, "confirmed");
+        assert_eq!(log.events[0].result, "allowed");
+        assert_eq!(log.events[1].event, "request_created");
+        assert!(log.events[0].timestamp.starts_with("2023-11-14T22:13:30"));
+        assert!(log.load_error.is_none());
+
+        // 前端按 camelCase 校验字段。
+        let json = serde_json::to_value(&log).expect("audit log should serialize");
+        assert!(json["events"][0].get("reasonCode").is_some());
+        assert!(json["events"][0].get("reason_code").is_none());
+        assert!(json.get("skippedLines").is_some());
+    }
+
+    #[test]
+    fn audit_log_reports_an_unreadable_file() {
+        // 审计文件被目录占位：只能报「不可读」，不能假装「没有事件」。
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        fs::create_dir_all(&state.audit_path).expect("occupy the audit path with a directory");
+
+        let log = state.audit_log();
+        assert_eq!(log.load_error, Some(ERROR_AUDIT_UNREADABLE));
+        assert!(log.events.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_summary_hides_credentials_and_keeps_the_error_code() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        let subject = gitguard_audit::AuditSubject::new(
+            "/tmp/example-repository",
+            Some("00000000-0000-4000-8000-000000000000"),
+            "origin",
+            "https://user:super-secret@example.com/team/repo.git",
+            1,
+        );
+        append_audit_event(
+            &state,
+            &subject,
+            1_700_000_000,
+            gitguard_audit::AuditEventKind::RequestCreated,
+            gitguard_audit::AuditResult::Pending,
+        );
+
+        let report = state.diagnostics(Some("request_invalid"));
+        let text = report.render();
+
+        assert!(text.contains("last_error_code: request_invalid"));
+        assert!(text.contains("audit_entries: 1"));
+        assert!(text.contains("https://***@example.com/team/repo.git"));
+        assert!(!text.contains("super-secret"));
+    }
+
+    #[test]
+    fn export_diagnostics_writes_into_the_config_directory() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        let report = state.diagnostics(None);
+        let config_dir = state.audit_path.parent().expect("audit path has a parent");
+
+        let path = gitguard_audit::export_report(&report, config_dir).expect("export diagnostics");
+
+        assert_eq!(path.parent(), Some(temp.path()));
+        let text = fs::read_to_string(&path).expect("read exported report");
+        assert!(text.starts_with("gitguard diagnostics\n"));
     }
 
     #[test]

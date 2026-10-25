@@ -1,9 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   GitGuardCommandError,
+  buildDiagnostics,
+  copyText,
+  exportDiagnostics,
+  getAuditLog,
   getPendingPush,
   getSettings,
   listenOpenSettings,
+  parseAuditLog,
   parsePushConfirmation,
   pickRepositoryDirectory,
   setAppMenu,
@@ -130,6 +135,36 @@ describe("command wrappers", () => {
       locale: "en-US",
     });
   });
+
+  it("forwards the last error code when building the diagnostics summary", async () => {
+    mocks.invoke.mockResolvedValue("gitguard diagnostics\n");
+
+    await expect(buildDiagnostics("request_invalid")).resolves.toBe(
+      "gitguard diagnostics\n",
+    );
+    expect(mocks.invoke).toHaveBeenCalledWith("build_diagnostics", {
+      lastErrorCode: "request_invalid",
+    });
+  });
+
+  it("returns the exported diagnostics path", async () => {
+    mocks.invoke.mockResolvedValue("/tmp/gitguard/diagnostics-1.txt");
+
+    await expect(exportDiagnostics(null)).resolves.toBe(
+      "/tmp/gitguard/diagnostics-1.txt",
+    );
+    expect(mocks.invoke).toHaveBeenCalledWith("export_diagnostics", {
+      lastErrorCode: null,
+    });
+  });
+
+  it("rejects with a stable code when the audit payload is incomplete", async () => {
+    mocks.invoke.mockResolvedValue({ path: "/tmp/gitguard/audit.jsonl" });
+
+    await expect(getAuditLog()).rejects.toMatchObject({
+      code: "internal_error",
+    });
+  });
 });
 
 describe("listenOpenSettings", () => {
@@ -169,5 +204,106 @@ describe("pickRepositoryDirectory", () => {
 
     mocks.openDialog.mockResolvedValue(["/tmp/a", "/tmp/b"]);
     await expect(pickRepositoryDirectory()).resolves.toBeNull();
+  });
+});
+
+/** 一份形状合法的审计页数据；字段名与 Rust 视图的 camelCase 一致。 */
+function validAuditLog() {
+  return {
+    path: "/tmp/gitguard/audit.jsonl",
+    retentionDays: 30,
+    maxEntries: 2000,
+    events: [
+      {
+        timestampEpochSecs: 1_790_000_000,
+        timestamp: "2026-09-21T14:13:20Z",
+        event: "confirmed",
+        result: "allowed",
+        reasonCode: "user_confirmed",
+        channel: "desktop",
+        repositoryPath: "/tmp/example",
+        repositoryId: "repo-1",
+        remoteName: "origin",
+        remoteUrl: "https://***@example.com/team/example.git",
+        requestId: "request-1",
+        refCount: 1,
+      },
+    ],
+    skippedLines: 0,
+    truncated: false,
+    loadError: null,
+    configError: null,
+    ipcError: null,
+  };
+}
+
+describe("parseAuditLog", () => {
+  it("accepts a complete payload and keeps already-redacted values", () => {
+    const parsed = parseAuditLog(validAuditLog());
+
+    expect(parsed?.events).toHaveLength(1);
+    expect(parsed?.events[0]?.result).toBe("allowed");
+    expect(parsed?.events[0]?.remoteUrl).toBe(
+      "https://***@example.com/team/example.git",
+    );
+    expect(parsed?.retentionDays).toBe(30);
+  });
+
+  it("treats missing optional ids as absent instead of inventing them", () => {
+    const payload = validAuditLog();
+    delete (payload.events[0] as Record<string, unknown>).repositoryId;
+    delete (payload.events[0] as Record<string, unknown>).requestId;
+
+    const parsed = parseAuditLog(payload);
+
+    expect(parsed?.events[0]?.repositoryId).toBeNull();
+    expect(parsed?.events[0]?.requestId).toBeNull();
+  });
+
+  it("rejects unknown event, result or channel codes", () => {
+    const unknownEvent = validAuditLog();
+    unknownEvent.events[0].event = "pushed";
+    expect(parseAuditLog(unknownEvent)).toBeNull();
+
+    const unknownResult = validAuditLog();
+    unknownResult.events[0].result = "mirrored";
+    expect(parseAuditLog(unknownResult)).toBeNull();
+
+    const unknownChannel = validAuditLog();
+    unknownChannel.events[0].channel = "email";
+    expect(parseAuditLog(unknownChannel)).toBeNull();
+
+    expect(parseAuditLog(null)).toBeNull();
+    expect(parseAuditLog({ path: "/tmp/audit.jsonl" })).toBeNull();
+  });
+});
+
+describe("copyText", () => {
+  afterEach(() => {
+    Reflect.deleteProperty(window.navigator, "clipboard");
+  });
+
+  it("reports failure when the clipboard is unavailable", async () => {
+    await expect(copyText("text")).resolves.toBe(false);
+  });
+
+  it("reports failure instead of throwing when the write is rejected", async () => {
+    Object.defineProperty(window.navigator, "clipboard", {
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+      configurable: true,
+    });
+
+    await expect(copyText("text")).resolves.toBe(false);
+  });
+
+  it("writes the summary when the clipboard allows it", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(window.navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    await expect(copyText("gitguard diagnostics")).resolves.toBe(true);
+    expect(writeText).toHaveBeenCalledWith("gitguard diagnostics");
   });
 });

@@ -18,6 +18,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use gitguard_audit::{redact_url, sanitize_text};
 use gitguard_core::{CommitInfo, GitGuardError, RefUpdate, Result};
 
 /// 每页展示的行数。提交很多时用户可以翻页查看，不会一次刷满终端。
@@ -32,7 +33,7 @@ const LABEL_WIDTH: usize = 11;
 /// 终端配色开关：负责给关键内容着色，同时过滤所有来自仓库的文本。
 ///
 /// 安全约定：ref 名、作者、提交标题、remote URL 等外部文本一律先经过这里的方法，
-/// 它们在包裹颜色码之前会统一做 [`sanitize`]，因此仓库内容无法夹带 ANSI 转义
+/// 它们在包裹颜色码之前会统一做 [`sanitize_text`]，因此仓库内容无法夹带 ANSI 转义
 /// 序列伪造界面；输出里的转义序列只由本模块自己写入。
 ///
 /// 当 `NO_COLOR` 存在或 `TERM=dumb` 时退化为纯文本，保证重定向、录制与
@@ -58,7 +59,7 @@ impl Paint {
 
     /// 用 SGR 参数（如 `1;36`）包装文本；关闭颜色时只做过滤。
     fn style(&self, code: &str, text: &str) -> String {
-        let text = sanitize(text);
+        let text = sanitize_text(text);
         if self.enabled {
             format!("\x1b[{code}m{text}\x1b[0m")
         } else {
@@ -171,6 +172,15 @@ where
         Ok(decision) => Ok(Some(decision)),
         Err(_) => Ok(Some(Decision::TimedOut)),
     }
+}
+
+/// 当前进程是否有可交互的控制终端。
+///
+/// CLI 在记录 `request_created` 审计事件之前调用：只有确定能在终端里确认时，
+/// 才把本次请求记为终端通道；否则记为桌面端通道。判断条件与 [`confirm_with`]
+/// 完全一致（stdout/stderr 至少一个是终端，且能打开 `/dev/tty`）。
+pub(crate) fn is_available() -> bool {
+    has_interactive_output() && open_control_terminal().is_some()
 }
 
 /// stdout 或 stderr 是否至少有一个连着终端。
@@ -432,33 +442,6 @@ fn format_timestamp(timestamp: &str) -> String {
     }
 }
 
-/// 过滤控制字符，防止仓库内容借终端转义序列干扰确认界面。
-///
-/// 控制字符（`\n`、`\t`、`ESC` 等）统一替换成空格；双向文本控制符会让
-/// 显示顺序与实际内容不一致，也一并去掉。
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character.is_control() || is_bidi_control(character) {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
-/// 判断是否是改变显示顺序的双向文本控制符（RTL/LTR override 等）。
-fn is_bidi_control(character: char) -> bool {
-    matches!(
-        character,
-        '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
-}
-
 /// 按字符数截断过长文本，避免一条超长标题撑满终端。
 fn truncate(text: &str) -> String {
     if text.chars().count() <= MAX_SUBJECT_CHARS {
@@ -467,23 +450,6 @@ fn truncate(text: &str) -> String {
     let mut shortened: String = text.chars().take(MAX_SUBJECT_CHARS).collect();
     shortened.push_str("...");
     shortened
-}
-
-/// 隐去 URL 里的用户名与密码。
-///
-/// `https://user:token@example.com/repo.git` → `https://***@example.com/repo.git`。
-/// 只在 `scheme://` 的 authority 部分查找 `@`，路径里合法的 `@` 不会被误删；
-/// 没有 userinfo 或不是 `scheme://` 形式（如 `git@example.com:repo.git`）时原样返回。
-fn redact_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return sanitize(url);
-    };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    match authority.rsplit_once('@') {
-        Some((_userinfo, host)) => format!("{}://***@{}{}", scheme, host, tail),
-        None => sanitize(url),
-    }
 }
 
 #[cfg(test)]

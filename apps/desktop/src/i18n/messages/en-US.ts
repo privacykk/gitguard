@@ -183,21 +183,87 @@ const enUS = {
   audit: {
     title: "Audit log",
     subtitle:
-      "Record push confirmations and configuration changes for later review.",
-    unavailableTitle: "The audit log is not available yet",
-    unavailableBody:
-      "GitGuard only writes errors to stderr; it does not persist an audit trail and never uploads data. The audit log is on the roadmap and is not implemented.",
-    plannedTitle: "Planned capabilities",
-    plannedPush: "Push event records",
-    plannedPushBody:
-      "Record the request, the confirmed or rejected result, and the time.",
-    plannedConfig: "Configuration change records",
-    plannedConfigBody:
-      "Record switch, timeout and repository registration changes.",
-    plannedExport: "Redaction and export",
-    plannedExportBody:
-      "Filter credentials and control characters before export so logs do not become a new leak surface.",
-    boundary: "Nothing shown in the current UI constitutes an audit record.",
+      "Review push confirmations written on this machine and export a redacted diagnostics summary.",
+    refresh: "Refresh",
+    copyDiagnostics: "Copy diagnostics",
+    exportDiagnostics: "Export diagnostics",
+    readOnly:
+      "Without a desktop backend the audit file cannot be read and no diagnostics can be generated.",
+    loadErrorBody:
+      "The audit file cannot be read; it may have moved, lack permissions, or be occupied by a directory.",
+    loadErrorHint:
+      "Push decisions are unaffected; copy the diagnostics summary and check the audit path and permissions.",
+    actionHint:
+      "Copy the diagnostics summary, which includes recent audit events and stable error codes.",
+    copyFailed:
+      "This environment does not allow clipboard writes; use Export diagnostics instead.",
+    copied: "Diagnostics summary copied (redacted by default).",
+    exported: "Exported to {path}",
+    truncated: "The audit file is large, so only the tail is read and shown.",
+    stats: {
+      events: "Events shown",
+      eventsHint: "Newest first; only the tail is shown past the read limit.",
+      skipped: "Skipped lines",
+      skippedHint: "Lines that cannot be parsed are counted, never guessed.",
+      retention: "Retention",
+      retentionValue: "{days} days / {entries} entries",
+      retentionHint: "Out-of-range events are removed after the next write.",
+    },
+    eventsTitle: "Push confirmation events",
+    eventsHint:
+      "The CLI writes these events during a push; the desktop app only reads them.",
+    emptyTitle: "No audit events yet",
+    emptyBody:
+      "Run a git push that requires confirmation on this machine and the request and result appear here.",
+    pathTitle: "Audit file",
+    pathHint:
+      "Lives next to the configuration file with mode 0600 (only the current user can read or write it).",
+    fields: {
+      channel: "Channel",
+      remote: "Remote",
+      repository: "Repository",
+      repositoryId: "Repository ID",
+      request: "Request ID",
+      refs: "Refs",
+    },
+    results: {
+      pending: "Pending",
+      allowed: "Allowed",
+      rejected: "Rejected",
+      unknown: "Unknown result",
+    },
+    channels: {
+      terminal: "Terminal",
+      desktop: "Desktop",
+      unknown: "Unknown channel",
+    },
+    events: {
+      request_created: "Request created",
+      confirmed: "Confirmed",
+      cancelled: "Cancelled",
+      timeout: "Timed out",
+      failure: "Failed",
+      unknown: "Unknown event",
+    },
+    reasons: {
+      confirmation_required: "Confirmation required",
+      user_confirmed: "Confirmed by the user",
+      user_cancelled: "Cancelled by the user",
+      confirmation_timeout: "Timed out waiting for confirmation",
+      terminal_unavailable: "Terminal unavailable",
+      ipc_unavailable: "Desktop app unreachable",
+      confirmation_failed: "Confirmation failed",
+      request_mismatch: "Request mismatch",
+      refs_changed: "Refs changed",
+      commit_list_unavailable: "Could not list the commits to push",
+      invalid_input: "Invalid input",
+      io_error: "Read or write failed",
+      policy_unavailable: "Policy unavailable",
+      internal_error: "Internal error",
+      unknown: "Unknown reason",
+    },
+    boundary:
+      "The audit file is an ordinary local file that any local user can modify, so it is not a tamper-proof record; neither is what this page shows a substitute for Git's own push history.",
   },
   settings: {
     title: "Settings",
@@ -286,6 +352,39 @@ const enUS = {
     ipc_unavailable:
       "The desktop IPC service is not running, so hooks cannot connect.",
     internal_error: "Internal desktop error.",
+    audit_unreadable: "The audit file cannot be read.",
+    diagnostics_write_failed:
+      "The diagnostics summary could not be written to the configuration directory.",
+    hints: {
+      unknown:
+        "Copy the diagnostics summary and retry; if it persists, check the IPC and hook status.",
+      configuration_unreadable:
+        "Check that the configuration file is valid JSON; GitGuard never overwrites a file it cannot read.",
+      configuration_write_failed:
+        "Make sure the configuration directory is writable (permissions and disk space), then retry.",
+      repository_not_found:
+        "Refresh the settings page; the repository may have been removed from the list.",
+      hook_install_failed:
+        "Make sure .git/hooks is writable, then add the repository again from Repositories.",
+      cli_binary_not_found:
+        "Keep the gitguard CLI next to the desktop app, or set GITGUARD_CLI_PATH.",
+      not_a_repository:
+        "Choose a directory that contains .git; subdirectories must also be inside a Git repository.",
+      path_not_absolute: "Use Choose folder to fill in an absolute path.",
+      no_pending_request:
+        "The request may have timed out or been cancelled; start the push again from your terminal or Git client.",
+      request_invalid:
+        "The repository changed while confirming; review what will be pushed and try again.",
+      invalid_timeout: "Enter a whole number of seconds from 1 to 3600.",
+      ipc_unavailable:
+        "Restart the desktop app; if it persists, check whether the socket file in the configuration directory is in use.",
+      internal_error:
+        "Restart the desktop app and retry; if it still fails, copy the diagnostics summary.",
+      audit_unreadable:
+        "Check the audit file path and permissions; a deleted file is recreated by the next push.",
+      diagnostics_write_failed:
+        "Make sure the configuration directory is writable, or copy the summary instead.",
+    },
   },
 } satisfies MessageSchema;
 

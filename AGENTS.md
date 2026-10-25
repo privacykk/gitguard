@@ -13,9 +13,10 @@ GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScrip
 - 终端确认：`crates/gitguard-cli/src/terminal.rs` 通过 `/dev/tty` 在当前终端展示 remote、ref 与待推送 commit，分页浏览，输入 `y`/`yes` 确认。
 - 桌面端：Unix Domain Socket IPC 服务、待确认请求列表与提交预览、用户输入 `yes` 后重新校验 ref 并回 `Confirmed`（不执行 Git 命令）、仓库登记与 Hook 安装、超时设置。
 - `gitguard-hook`：Hook 安装 / 卸载 / 健康检查，外来 Hook 备份为 `pre-push.gitguard-backup` 并链式调用。
+- 审计与诊断：`gitguard-audit` 定义推送确认事件与统一脱敏，CLI 在推送进程内写入 `<配置目录>/audit.jsonl`（JSONL，保留 30 天 / 2000 条，写入失败只告警）；桌面端只读，提供审计页、错误码排查建议以及「复制 / 导出诊断摘要」。
 - Rust 单元测试，以及 Unix 上真实执行 `git push` 的集成测试。
 
-**尚不存在**：SQLite 与数据模型、身份/remote 管理、正式策略配置与优先级计算、一次性批准之外的授权模型、Hook 升级与完整性校验、系统凭据库、日志脱敏与审计、跨平台（Windows）实现、三平台真实环境验收。
+**尚不存在**：SQLite 与数据模型、身份/remote 管理、正式策略配置与优先级计算、一次性批准之外的授权模型、Hook 升级与完整性校验、系统凭据库、审计的防篡改与配置变更记录、跨平台（Windows）实现、三平台真实环境验收。
 
 因此：
 
@@ -33,20 +34,21 @@ GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScrip
 
 ## 3. 仓库地图
 
-| 路径                       | 职责                                                                                                                                         |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/gitguard-core`     | `Decision`、`PolicyResult`、`RefUpdate`、推送确认请求/响应、`GitGuardError`、`CliExitCode`                                                   |
-| `crates/gitguard-policy`   | 原型策略 `evaluate` 与 `PrototypePolicy`，纯逻辑，仅供 `--policy` 调试模式                                                                   |
-| `crates/gitguard-config`   | 本地 JSON 配置读写（全局默认值、仓库开关、Hook 状态），原子写入，不做策略                                                                    |
-| `crates/gitguard-ipc`      | Unix Domain Socket 的 JSON 传输层、超时与 socket 权限（`0600`），不做策略                                                                    |
-| `crates/gitguard-hook`     | `pre-push` Hook 安装/卸载/健康检查与备份链式调用；把桌面端分配的仓库 id 写入脚本（只接受 UUID 字符集），不判断是否推送                       |
-| `crates/gitguard-cli`      | 参数校验（`--repository-id` / `--policy`）、完整读取 stdin、逐行解析 ref、按 id / 路径 / 全局开关判定、选择通道、退出码映射（`gitguard`）    |
-| `crates/gitguard-git`      | 仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断（`Command` 参数数组，不执行 push，不做策略）                                       |
-| `apps/desktop/src`         | Vue 界面、侧边栏页面导航（`navigation.ts`）、i18n 语言包、状态码映射与返回值形状校验、`components/ui` 公共展示组件，只展示状态，不做策略判断 |
-| `apps/desktop/src-tauri`   | `AppState`、IPC 服务端、Tauri commands、原生菜单构建（`menu.rs`）；确认时只回 `Confirmed`，不执行 Git                                        |
-| `docs/`                    | 架构、安全、开发规范、MVP 路线图与桌面端界面规范                                                                                             |
-| `.vscode/settings.json`    | 工作区级编辑器配置：关闭 Vetur 校验，Vue 语言服务只走 Volar（详见 §6）                                                                       |
-| `.github/workflows/ci.yml` | 唯一 CI 流水线                                                                                                                               |
+| 路径                       | 职责                                                                                                                                                                                   |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/gitguard-core`     | `Decision`、`PolicyResult`、`RefUpdate`、推送确认请求/响应、`GitGuardError`、`CliExitCode`                                                                                             |
+| `crates/gitguard-policy`   | 原型策略 `evaluate` 与 `PrototypePolicy`，纯逻辑，仅供 `--policy` 调试模式                                                                                                             |
+| `crates/gitguard-config`   | 本地 JSON 配置读写（全局默认值、仓库开关、Hook 状态），原子写入，不做策略                                                                                                              |
+| `crates/gitguard-ipc`      | Unix Domain Socket 的 JSON 传输层、超时与 socket 权限（`0600`），不做策略                                                                                                              |
+| `crates/gitguard-hook`     | `pre-push` Hook 安装/卸载/健康检查与备份链式调用；把桌面端分配的仓库 id 写入脚本（只接受 UUID 字符集），不判断是否推送                                                                 |
+| `crates/gitguard-cli`      | 参数校验（`--repository-id` / `--policy`）、完整读取 stdin、逐行解析 ref、按 id / 路径 / 全局开关判定、选择通道、写审计事件（失败只告警）、退出码映射（`gitguard`）                    |
+| `crates/gitguard-audit`    | 审计事件模型与原因码、统一脱敏（URL / Token / 私钥 / 控制字符）、JSONL 追加与保留清理、诊断摘要渲染与导出；不做策略、不执行 Git                                                        |
+| `crates/gitguard-git`      | 仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断（`Command` 参数数组，不执行 push，不做策略）                                                                                 |
+| `apps/desktop/src`         | Vue 界面、侧边栏页面导航（`navigation.ts`）、i18n 语言包、状态码映射与返回值形状校验、`components/ui` 公共展示组件，只展示状态，不做策略判断                                           |
+| `apps/desktop/src-tauri`   | `AppState`（含审计路径）、IPC 服务端、Tauri commands（含 `get_audit_log` / `build_diagnostics` / `export_diagnostics`）、原生菜单构建（`menu.rs`）；确认时只回 `Confirmed`，不执行 Git |
+| `docs/`                    | 架构、安全、开发规范、MVP 路线图与桌面端界面规范                                                                                                                                       |
+| `.vscode/settings.json`    | 工作区级编辑器配置：关闭 Vetur 校验，Vue 语言服务只走 Volar（详见 §6）                                                                                                                 |
+| `.github/workflows/ci.yml` | 唯一 CI 流水线                                                                                                                                                                         |
 
 ## 4. 环境与命令
 
@@ -72,7 +74,8 @@ GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScrip
 ```text
 Vue UI → Tauri commands → gitguard-hook / gitguard-git / gitguard-config / gitguard-ipc → gitguard-core
 Git pre-push Hook → gitguard-cli → gitguard-policy → gitguard-core
-Git pre-push Hook → gitguard-cli → gitguard-config / gitguard-git / gitguard-ipc
+Git pre-push Hook → gitguard-cli → gitguard-config / gitguard-git / gitguard-ipc / gitguard-audit
+Tauri commands（只读）→ gitguard-audit → gitguard-core
 gitguard-cli → /dev/tty（终端确认通道）
 gitguard-cli ⇄ Unix Domain Socket ⇄ Tauri commands
 ```
@@ -83,6 +86,7 @@ gitguard-cli ⇄ Unix Domain Socket ⇄ Tauri commands
 - `gitguard-cli` 的终端界面：交互只读写 `/dev/tty`（Hook stdin 已被 Git 占用），渲染前必须过滤控制字符、ANSI 与 bidi 控制符并脱敏 URL 凭据；分页、超时与未知输入都不得被视为确认。
 - `gitguard-git`：只封装 Git 调用（仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断）；不判断策略，不拼 shell，不执行 push，统一设置 `GIT_TERMINAL_PROMPT=0`，OID 与 ref 先校验再传给 Git。
 - `gitguard-ipc`：只搬运请求/响应；通信失败一律返回 `IpcError`，不得把「没有响应」当成确认。
+- `gitguard-audit`：只定义审计事件、脱敏规则、JSONL 读写与诊断摘要；不判断策略、不执行 Git、不读环境变量。审计只由 CLI 写入，桌面端只读；写入或保留清理失败只由 CLI 往 `stderr` 记一行，不得改变退出码或推送结果；任何字段在写盘与展示前都必须脱敏，审计缺失、损坏或被改写都不得被当成「已确认」。
 - `gitguard-hook`：只管理 Hook 文件；不得覆盖未备份的用户 Hook，不得启动常驻进程；写进脚本的仓库 id 必须校验字符集与长度，不得把未过滤的外部字符串拼进脚本。
 - `apps/desktop/src-tauri`：不实现策略，也不执行 Git 命令；确认时先重新校验 ref 再回 `Confirmed`，推送由原 `git push` 完成。原生菜单（`menu.rs`）只做国际化与「设置…」导航，不得新增任何绕开 Hook 的入口。
 - `apps/desktop`：不得实现策略；前端状态、快捷键与隐藏按钮不构成安全控制，放行决定只能来自 Rust。

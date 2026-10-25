@@ -5,9 +5,9 @@
 
 ## 1. 阶段与范围
 
-当前处于**推送二次确认 MVP 阶段**（仅 macOS / Linux）：`pre-push` Hook、`gitguard-cli` 的配置/确认流程、Unix Domain Socket IPC、桌面端确认界面、仓库登记与 Hook 安装均已实现。
+当前处于**推送二次确认 MVP 阶段**（仅 macOS / Linux）：`pre-push` Hook、`gitguard-cli` 的配置/确认流程、Unix Domain Socket IPC、桌面端确认界面、仓库登记与 Hook 安装、推送确认审计与诊断摘要均已实现。
 
-- 规划中但尚未实现的模块不得在代码、UI、文档中声明为可用：SQLite 与数据模型、身份/remote 管理、正式策略配置与优先级计算、Hook 升级与完整性校验、系统凭据库、日志脱敏与审计、Windows 实现、三平台真实环境验收。
+- 规划中但尚未实现的模块不得在代码、UI、文档中声明为可用：SQLite 与数据模型、身份/remote 管理、正式策略配置与优先级计算、Hook 升级与完整性校验、系统凭据库、审计的防篡改与配置变更记录、Windows 实现、三平台真实环境验收。
 - 新增能力前先确认它属于当前阶段目标；跨阶段功能应先更新路线图再实现。
 - 所有放行决定必须来自 Rust；前端只负责展示与交互。
 
@@ -83,6 +83,7 @@ cargo build -p gitguard-cli
   - 外部输入不使用 `unwrap()`；`expect()` 仅用于测试或启动期不可恢复错误，消息须说明不变量。
   - 不使用 `io::Error::new(io::ErrorKind::Other, ..)`，改用 `io::Error::other(..)`。
 - 不使用日志文本驱动业务行为；错误信息只写 `stderr`。
+- 审计只由 CLI 在推送进程内写入；写入与保留清理失败只往 `stderr` 加一行，不得改变退出码、`Outcome` 或推送结果。写盘前与展示前必须经 `gitguard-audit` 的脱敏，不得把未脱敏的 remote URL、提交内容或环境变量写进审计与诊断。
 - `Decision`、`PolicyResult.reason_code`、`CliExitCode` 是稳定契约，改动需同步文档与测试。
 - 策略层保持纯逻辑：显式输入、显式输出，不依赖 UI、IO、时间或随机数。
 - 新增第三方依赖需说明用途与替代方案；仅测试使用放 `dev-dependencies`。
@@ -137,6 +138,7 @@ cargo build -p gitguard-cli
 - 放在实现文件内的 `#[cfg(test)] mod tests`，使用 `super::*`。
 - 策略测试覆盖三种决策、`reason_code` 与无法判断时的错误返回。
 - 解析测试覆盖空输入、非法行、非法 OID（长度与十六进制）、多 refs、创建与删除。
+- 审计测试覆盖 URL 凭据、`KEY=VALUE` 形式的 Token / 密码、PEM 私钥与控制字符的脱敏，保留期与条数上限的清理，以及坏行计数；断言输出中不再出现原始凭据。
 
 ### 6.3 Git Hook 集成测试
 
@@ -160,6 +162,7 @@ cargo build -p gitguard-cli
 - [ ] 未知或不可判断路径仍然 fail-closed，没有新的默认放行分支。
 - [ ] 没有新增网络请求、遥测、云同步或后台常驻服务。
 - [ ] 没有将 Token、私钥、环境变量或含密码 URL 写入代码、日志、错误信息或测试夹具。
+- [ ] 审计与诊断输出经过统一脱敏；审计写入失败只告警，不改变退出码；审计缺失或损坏不被当成「已确认」。
 - [ ] 没有把外部输入拼接为 shell 命令；外部程序调用使用参数数组。
 - [ ] 没有静默安装、覆盖或删除用户仓库中的 Hook；外来 Hook 必须先备份并链式调用。
 - [ ] 没有把前端隐藏、按钮状态或本地缓存当作安全控制。

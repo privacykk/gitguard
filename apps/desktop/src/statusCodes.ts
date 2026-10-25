@@ -69,6 +69,8 @@ export const COMMAND_ERROR_CODES = [
   "invalid_timeout",
   "ipc_unavailable",
   "internal_error",
+  "audit_unreadable",
+  "diagnostics_write_failed",
 ] as const;
 
 export type CommandErrorCode = (typeof COMMAND_ERROR_CODES)[number];
@@ -96,4 +98,108 @@ export function toCommandErrorMessageKey(value: unknown): string {
   return isCommandErrorCode(value)
     ? `errors.${value}`
     : UNKNOWN_ERROR_MESSAGE_KEY;
+}
+
+/**
+ * 把错误码转成排查建议 key。
+ *
+ * 建议只是操作提示，不改变任何状态；未知码同样给出通用建议，
+ * 不能因为“不知道该建议什么”就把失败显示成成功。
+ */
+export function toCommandErrorHintKey(value: unknown): string {
+  return isCommandErrorCode(value)
+    ? `errors.hints.${value}`
+    : "errors.hints.unknown";
+}
+
+/** `AuditEventKind` 的已知取值（与 Rust `gitguard-audit` 保持一致）。 */
+export const AUDIT_EVENT_CODES = [
+  "request_created",
+  "confirmed",
+  "cancelled",
+  "timeout",
+  "failure",
+] as const;
+
+export type AuditEventCode = (typeof AUDIT_EVENT_CODES)[number];
+
+/** `AuditResult` 的已知取值。 */
+export const AUDIT_RESULT_CODES = ["pending", "allowed", "rejected"] as const;
+
+export type AuditResultCode = (typeof AUDIT_RESULT_CODES)[number];
+
+/** `AuditChannel` 的已知取值。 */
+export const AUDIT_CHANNEL_CODES = ["terminal", "desktop"] as const;
+
+export type AuditChannelCode = (typeof AUDIT_CHANNEL_CODES)[number];
+
+/** 审计原因码；与 `gitguard_audit::reason` 一一对应。 */
+export const AUDIT_REASON_CODES = [
+  "confirmation_required",
+  "user_confirmed",
+  "user_cancelled",
+  "confirmation_timeout",
+  "terminal_unavailable",
+  "ipc_unavailable",
+  "confirmation_failed",
+  "request_mismatch",
+  "refs_changed",
+  "commit_list_unavailable",
+  "invalid_input",
+  "io_error",
+  "policy_unavailable",
+  "internal_error",
+] as const;
+
+export type AuditReasonCode = (typeof AUDIT_REASON_CODES)[number];
+
+export function isAuditEventCode(value: unknown): value is AuditEventCode {
+  return AUDIT_EVENT_CODES.some((code) => code === value);
+}
+
+export function isAuditResultCode(value: unknown): value is AuditResultCode {
+  return AUDIT_RESULT_CODES.some((code) => code === value);
+}
+
+export function isAuditChannelCode(value: unknown): value is AuditChannelCode {
+  return AUDIT_CHANNEL_CODES.some((code) => code === value);
+}
+
+/** 审计事件类型的文案 key；未知值落到通用的“未知事件”。 */
+export function toAuditEventMessageKey(value: unknown): string {
+  return isAuditEventCode(value)
+    ? `audit.events.${value}`
+    : "audit.events.unknown";
+}
+
+/** 审计结果的文案 key；未知值不推断成“已放行”。 */
+export function toAuditResultMessageKey(value: unknown): string {
+  return isAuditResultCode(value)
+    ? `audit.results.${value}`
+    : "audit.results.unknown";
+}
+
+/** 审计结果的色调；只有明确的 `allowed` 才用绿色。 */
+export function toAuditResultTone(value: unknown): StatusTone {
+  if (value === "allowed") {
+    return "success";
+  }
+  if (value === "rejected") {
+    return "danger";
+  }
+  return "warning";
+}
+
+/** 确认通道的文案 key；未知通道保留为未知，不假设为桌面端。 */
+export function toAuditChannelMessageKey(value: unknown): string {
+  return isAuditChannelCode(value)
+    ? `audit.channels.${value}`
+    : "audit.channels.unknown";
+}
+
+/** 原因码的文案 key；未知原因码只显示“未知原因”，不回显原始字符串。 */
+export function toAuditReasonMessageKey(value: unknown): string {
+  return AUDIT_REASON_CODES.some((code) => code === value)
+    ? `audit.reasons.${String(value)}`
+    : "audit.reasons.unknown";
 }

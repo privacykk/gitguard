@@ -20,7 +20,11 @@ import {
 import AppSidebar from "./components/AppSidebar.vue";
 import NoticeBanner from "./components/ui/NoticeBanner.vue";
 import type { AppView } from "./navigation";
-import { commandErrorCode, toCommandErrorMessageKey } from "./statusCodes";
+import {
+  commandErrorCode,
+  toCommandErrorHintKey,
+  toCommandErrorMessageKey,
+} from "./statusCodes";
 import ApprovalView from "./views/ApprovalView.vue";
 import AuditView from "./views/AuditView.vue";
 import DashboardView from "./views/DashboardView.vue";
@@ -55,8 +59,10 @@ const appSettings = ref<Settings | null>(null);
 const confirmed = ref(false);
 /** 「确认超时时间已保存」提示；只有后端写入成功才置位，失败不谎报成功。 */
 const timeoutSaved = ref(false);
-/** 稳定错误码；有值时显示 fail-closed 提示，绝不显示成「已放行」。 */
+/** 稳定错误码；同时用于提示文案、排查建议与诊断摘要。 */
+const errorCode = ref<string | null>(null);
 const errorKey = ref<string | null>(null);
+const errorHintKey = ref<string | null>(null);
 
 /** 顶部提示区是否需要占位：有任一提示时才渲染容器，避免空 div 留白。 */
 const hasNotice = computed(
@@ -73,7 +79,17 @@ let stopListening: (() => void) | undefined;
 let stopMenuListening: (() => void) | undefined;
 
 function setError(reason: unknown): void {
-  errorKey.value = toCommandErrorMessageKey(commandErrorCode(reason));
+  const code = commandErrorCode(reason);
+  errorCode.value = code;
+  errorKey.value = toCommandErrorMessageKey(code);
+  errorHintKey.value = toCommandErrorHintKey(code);
+}
+
+/** 清掉上一次的错误提示；新操作开始时调用，避免旧建议误导。 */
+function clearError(): void {
+  errorCode.value = null;
+  errorKey.value = null;
+  errorHintKey.value = null;
 }
 
 /** 读取上次的收起状态；存储不可用时按展开处理。 */
@@ -160,7 +176,7 @@ async function loadSettings(): Promise<void> {
 function applyPending(next: PushConfirmation | null): void {
   if (next !== null && next.requestId !== pending.value?.requestId) {
     confirmed.value = false;
-    errorKey.value = null;
+    clearError();
     navigate("approval");
   }
   pending.value = next;
@@ -252,7 +268,7 @@ async function handleConfirm(): Promise<void> {
   }
 
   busy.value = true;
-  errorKey.value = null;
+  clearError();
   try {
     await confirmPush(current.requestId);
     showConfirmed();
@@ -288,7 +304,7 @@ async function handleAddRepository(
   enabled: boolean,
 ): Promise<void> {
   busy.value = true;
-  errorKey.value = null;
+  clearError();
   try {
     await addRepository(path, enabled);
     await loadSettings();
@@ -302,7 +318,7 @@ async function handleAddRepository(
 /** 修改「未登记的仓库是否需要推送确认」；不影响已登记仓库。 */
 async function handleSetUnregisteredProtection(enabled: boolean): Promise<void> {
   busy.value = true;
-  errorKey.value = null;
+  clearError();
   try {
     await setUnregisteredProtection(enabled);
     await loadSettings();
@@ -318,7 +334,7 @@ async function handleToggleProtection(
   enabled: boolean,
 ): Promise<void> {
   busy.value = true;
-  errorKey.value = null;
+  clearError();
   try {
     await toggleProtection(repositoryId, enabled);
     await loadSettings();
@@ -331,7 +347,7 @@ async function handleToggleProtection(
 
 async function handleSaveTimeout(seconds: number): Promise<void> {
   busy.value = true;
-  errorKey.value = null;
+  clearError();
   timeoutSaved.value = false;
   try {
     await setConfirmationTimeout(seconds);
@@ -372,6 +388,7 @@ async function handleSaveTimeout(seconds: number): Promise<void> {
             v-if="errorKey"
             type="error"
             :description="t(errorKey)"
+            :hint="errorHintKey ? t(errorHintKey) : undefined"
           />
           <NoticeBanner
             v-else-if="confirmed"
@@ -435,7 +452,11 @@ async function handleSaveTimeout(seconds: number): Promise<void> {
             @cancel="handleCancel"
             @navigate="navigate"
           />
-          <AuditView v-else-if="view === 'audit'" />
+          <AuditView
+            v-else-if="view === 'audit'"
+            :desktop-available="desktopAvailable"
+            :last-error-code="errorCode"
+          />
           <SettingsView
             v-else
             :settings="appSettings"

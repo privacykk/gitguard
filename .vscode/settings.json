@@ -1,0 +1,13 @@
+// 本仓库的 Vue 语言服务统一交给 Volar（Vue - Official）。
+//
+// 编辑器里若同时启用 Vetur，它会用自带的 TS 服务解析 .vue，
+// 对 `import Foo from "./Foo.vue"` 报 “Module '.../Foo.vue' has no default export”。
+// 该报错与 `pnpm type-check`（vue-tsc）的结论相反，属于重复且错误的诊断，
+// 因此在工作区层面关掉 Vetur 的三类校验与格式化，只保留 Volar。
+{
+    "vetur.validation.script": false,
+    "vetur.validation.template": false,
+    "vetur.validation.style": false,
+    "vetur.format.enable": false,
+    "vetur.ignoreProjectWarning": true
+}

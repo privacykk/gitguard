@@ -4,6 +4,8 @@ dist/
 *.local
 .DS_Store
 .idea/
-.vscode/
+# 只保留工作区级设置（关闭 Vetur 重复诊断），其余编辑器文件不入库
+.vscode/*
+!.vscode/settings.json
 coverage/
 apps/desktop/src-tauri/gen/schemas/

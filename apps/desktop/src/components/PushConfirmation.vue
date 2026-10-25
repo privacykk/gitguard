@@ -19,6 +19,8 @@ const KIND_TAG_TYPES: Record<
 > = {
   create: "success",
   update: "primary",
+  // 非快进更新可能丢弃远端提交，和删除一样用警示色。
+  rewrite: "danger",
   delete: "danger",
 };
 
@@ -60,18 +62,8 @@ function sourceRefLabel(reference: RefPreview): string {
 </script>
 
 <template>
-  <SurfaceCard
-    title-id="push-confirmation-title"
-    :title="t('push.title')"
-    :description="t('push.intro')"
-    roomy
-  >
-    <el-descriptions
-      :column="1"
-      border
-      size="small"
-      label-width="7rem"
-    >
+  <SurfaceCard title-id="push-confirmation-title" :title="t('push.title')" :description="t('push.intro')" roomy>
+    <el-descriptions :column="1" border size="small" label-width="7rem">
       <el-descriptions-item :label="t('push.repository')">
         <span class="break-all font-mono text-meta">
           {{ confirmation.repositoryPath }}
@@ -86,31 +78,19 @@ function sourceRefLabel(reference: RefPreview): string {
     </el-descriptions>
 
     <ul class="m-0 grid list-none gap-3 p-0">
-      <li
-        v-for="reference in confirmation.refs"
-        :key="`${reference.localRef}->${reference.remoteRef}`"
-        class="rounded-lg border border-line-soft bg-canvas/60 p-4"
-      >
+      <li v-for="reference in confirmation.refs" :key="`${reference.localRef}->${reference.remoteRef}`"
+        class="rounded-lg border border-line-soft bg-canvas/60 p-4">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <p class="m-0 flex flex-wrap items-center gap-2 font-mono text-meta">
             <span class="text-ink-subtle">{{ t("push.sourceRef") }}</span>
             <span class="rounded bg-surface px-1.5 py-0.5 text-ink">{{ sourceRefLabel(reference) }}</span>
-            <el-icon
-              class="text-ink-subtle"
-              aria-hidden="true"
-            >
+            <el-icon class="text-ink-subtle" aria-hidden="true">
               <Right />
             </el-icon>
             <span class="text-ink-subtle">{{ t("push.targetRef") }}</span>
             <span class="rounded bg-surface px-1.5 py-0.5 text-ink">{{ reference.remoteRef }}</span>
           </p>
-          <el-tag
-            :type="KIND_TAG_TYPES[reference.kind]"
-            size="small"
-            effect="light"
-            round
-            disable-transitions
-          >
+          <el-tag :type="KIND_TAG_TYPES[reference.kind]" size="small" effect="light" round disable-transitions>
             {{ t(`push.kind.${reference.kind}`) }}
           </el-tag>
         </div>
@@ -118,75 +98,37 @@ function sourceRefLabel(reference: RefPreview): string {
         <h3 class="mt-3 mb-2 text-meta font-semibold text-ink">
           {{ t("push.commits") }}
         </h3>
-        <p
-          v-if="reference.commits.length === 0"
-          class="m-0 text-meta text-ink-muted"
-        >
+        <p v-if="reference.commits.length === 0" class="m-0 text-meta text-ink-muted">
           {{ t("push.noCommits") }}
         </p>
-        <CommitList
-          v-else
-          :commits="reference.commits"
-        />
+        <CommitList v-else :commits="reference.commits" />
       </li>
     </ul>
 
-    <div
-      class="grid gap-1.5"
-      aria-live="polite"
-    >
-      <p
-        class="m-0 text-meta font-medium"
-        :class="expired ? 'text-danger-600' : 'text-ink'"
-      >
+    <div class="grid gap-1.5" aria-live="polite">
+      <p class="m-0 text-meta font-medium" :class="expired ? 'text-danger-600' : 'text-ink'">
         {{
           expired
             ? t("push.expired")
             : t("push.remaining", { seconds: remainingSeconds })
         }}
       </p>
-      <el-progress
-        :percentage="remainingPercent"
-        :status="expired ? 'exception' : undefined"
-        :stroke-width="6"
-        :show-text="false"
-      />
+      <el-progress :percentage="remainingPercent" :status="expired ? 'exception' : undefined" :stroke-width="6"
+        :show-text="false" />
     </div>
 
-    <form
-      data-confirm-form
-      class="grid gap-3 border-t border-line-soft pt-4"
-      @submit.prevent="canConfirm && emit('confirm')"
-    >
-      <label
-        class="text-sm font-medium text-ink"
-        for="confirmation-answer"
-      >
+    <form data-confirm-form class="grid gap-3 border-t border-line-soft pt-4"
+      @submit.prevent="canConfirm && emit('confirm')">
+      <label class="text-sm font-medium text-ink" for="confirmation-answer">
         {{ t("push.yesLabel") }}
       </label>
-      <el-input
-        id="confirmation-answer"
-        v-model="answer"
-        type="text"
-        autocomplete="off"
-        class="max-w-60"
-        :placeholder="t('push.inputPlaceholder')"
-        :disabled="busy || expired"
-      />
+      <el-input id="confirmation-answer" v-model="answer" type="text" autocomplete="off" class="max-w-60"
+        :placeholder="t('push.inputPlaceholder')" :disabled="busy || expired" />
       <div class="flex flex-wrap gap-2">
-        <el-button
-          type="primary"
-          native-type="submit"
-          data-confirm
-          :disabled="!canConfirm"
-        >
+        <el-button type="primary" native-type="submit" data-confirm :disabled="!canConfirm">
           {{ busy ? t("push.executing") : t("push.confirmButton") }}
         </el-button>
-        <el-button
-          data-cancel
-          :disabled="busy"
-          @click="emit('cancel')"
-        >
+        <el-button data-cancel :disabled="busy" @click="emit('cancel')">
           {{ t("push.cancelButton") }}
         </el-button>
       </div>

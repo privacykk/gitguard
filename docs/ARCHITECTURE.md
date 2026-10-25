@@ -21,7 +21,7 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 
 - `gitguard-core` 只放共享数据、错误和退出码，不执行 Git，不依赖 Tauri、Vue、数据库或 shell。
 - `gitguard-policy` 是纯策略函数：不访问 UI/数据库、不弹窗、不执行命令、不读时间或随机数；无法判断时不返回 `Allow`。
-- `gitguard-git` 是唯一执行 Git 的地方，统一使用 `Command` 参数数组、`GIT_TERMINAL_PROMPT=0`，外部输入先校验再交给 Git。
+- `gitguard-git` 是唯一执行 Git 的地方，统一使用 `Command` 参数数组、`GIT_TERMINAL_PROMPT=0`，外部输入先校验再交给 Git；祖先关系判断（`merge-base --is-ancestor`）只用于展示非快进风险。
 - `gitguard-ipc` 只搬运请求与响应，不做策略判断；通信失败一律是 `IpcError`。
 - `gitguard-hook` 只管理 Hook 文件，不判断是否允许推送，也不启动常驻进程。
 - 桌面端与前端都不实现策略：界面状态、隐藏按钮都不构成安全控制，放行决定只来自 Rust。
@@ -33,7 +33,7 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 | `gitguard-core`          | `Decision`、`PolicyResult`、`RefUpdate`、`PushConfirmationRequest/Response`、`ConfirmationDecision`、`GitGuardError`、`CliExitCode` |
 | `gitguard-policy`        | 原型策略 `evaluate`，供 `--policy` 调试模式使用                                                                                     |
 | `gitguard-config`        | 本地 JSON 配置读写（全局默认值、仓库登记与开关、Hook 状态），原子写入；损坏时不覆盖                                                 |
-| `gitguard-git`           | 仓库根路径、Hook 目录、提交列表、ref 预校验（`Command` 参数数组，不做策略）                                                         |
+| `gitguard-git`           | 仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断（`Command` 参数数组，不做策略）                                           |
 | `gitguard-ipc`           | Unix Domain Socket 服务端与客户端、JSON + 换行协议、超时、socket 权限 `0600`                                                        |
 | `gitguard-hook`          | `pre-push` Hook 的安装、卸载、备份链式调用与健康检查；把仓库 id 写进脚本供 CLI 对上配置记录                                         |
 | `gitguard-cli`           | 参数校验、读取 stdin、逐行解析 ref、按仓库 id / 路径 / 全局开关判定、选择通道、确认后重新校验 ref、退出码映射（bin：`gitguard`）    |
@@ -90,8 +90,9 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 - Hook 的 stdin 已被 Git 占用（传 ref 列表），因此终端交互必须另开 `/dev/tty`；stdout/stderr 是否终端只用于判断「用户能否看到输出」，两个条件同时成立才走终端确认。
 - 桌面端通道不依赖任何客户端能力：收到请求后保存为待确认请求，并把主窗口切到前台、请求系统注意力提示，避免用户看着图形客户端干等。
 - 终端界面每页 30 行，`m` / `b` 翻页，`y` / `yes` 确认，`n` / `no` 取消；EOF、超时与无法识别的输入一律按「未确认」处理。
-- 终端界面只展示必要信息：分支/标签名取 `refs/heads/`、`refs/tags/` 之后的简称（`branch: test (update)`），只有改名推送才显示 `local -> remote`；每条提交同时列出作者与分钟级时间；新建/更新/删除分别用绿/黄/红区分，`NO_COLOR` 或 `TERM=dumb` 时不着色。单页时不显示页码。
+- 终端界面只展示必要信息：分支/标签名取 `refs/heads/`、`refs/tags/` 之后的简称（`branch: test (update)`），只有改名推送才显示 `local -> remote`；每条提交同时列出作者与分钟级时间；新建绿、快进更新黄、历史改写（非快进）与删除红，`NO_COLOR` 或 `TERM=dumb` 时不着色。单页时不显示页码。
 - 渲染前过滤控制字符、ANSI 转义与 bidi 控制符，remote URL 中的用户名/密码替换为 `***`，避免伪造界面或泄漏凭据。
+- 非快进更新（`--force`、`--force-with-lease` 或 refspec 里的 `+`）标为 `rewrite`，桌面端同样区分，tag 更新一律按改写提示；祖先关系无法判断时（对象存在但不是 commit、Git 比对失败）也按改写展示。远端对象在本地缺失时提交列表无法列出，按 fail-closed 拒绝，不会出现标记。该标记只影响展示，不参与任何判定。
 - 读终端使用独立线程 + `mpsc::recv_timeout`，超时后主线程不会被阻塞，Hook 仍能按超时拒绝。
 
 ## 推送确认链路
@@ -101,7 +102,7 @@ gitguard-cli ── Unix Domain Socket ── Tauri commands
 3. CLI 完整读取 stdin，逐行解析 `local ref / local oid / remote ref / remote oid`；任意一行非法都拒绝整个请求。
 4. CLI 通过 `git rev-parse --show-toplevel` 得到仓库规范路径，读取配置；只有该仓库被显式关闭保护时才直接放行（退出码 0）。判定顺序（`gitguard_config::push_confirmation_state`）：脚本带 id 且配置里有同 id 记录 → 只看该记录的开关（仓库移动后仍沿用原选择）；带 id 但配置里找不到 → 按「记录丢失」处理，仍要求确认并提示重新登记；不带 id（旧版脚本）→ 按规范路径查记录，查不到才回落全局开关。
 5. 否则按上一节选择确认通道：终端通道在本地渲染并等待输入；桌面端通道构造 `PushConfirmationRequest`（`uuid` v4 作为 `request_id`），经 IPC 发送并等待响应，等待上限取配置值（最少 1 秒）。
-6. 桌面端收到请求后列出每个 ref 的待推送提交（列不出即回 `Error`），把它存为当前唯一待确认请求，向前端发 `push-request-received` 事件，并在最长「配置超时」内等待用户决定。
+6. 桌面端收到请求后列出每个 ref 的待推送提交（列不出即回 `Error`），把非快进更新标为 `rewrite` 风险，把它存为当前唯一待确认请求，向前端发 `push-request-received` 事件，并在最长「配置超时」内等待用户决定。
 7. 前端展示仓库、remote、目标 ref、提交列表与倒计时；用户必须手工输入 `yes` 才允许确认。
 8. 用户确认时，桌面端先 `verify_push_preconditions`（ref 仍指向请求中的 OID）；失败则回 `Error`，让 Hook 拒绝本次 push；通过则只回 `Confirmed`，不执行任何 Git 命令。
 9. CLI 收到 `Confirmed` 后再次 `verify_push_preconditions`，通过则输出提示并以退出码 0 结束，由原本的 `git push` 继续发送数据——推送只发生一次，且发生在用户自己的终端或客户端里。

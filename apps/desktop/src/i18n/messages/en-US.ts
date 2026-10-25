@@ -243,6 +243,8 @@ const enUS = {
     kind: {
       create: "This creates a new remote branch",
       update: "This updates a remote branch",
+      rewrite:
+        "Non-fast-forward update: if the remote accepts this push, commits on the remote that are missing locally will be dropped (usually --force / --force-with-lease)",
       delete: "This deletes a remote branch",
     },
     yesLabel: 'Type "yes" to perform this push',

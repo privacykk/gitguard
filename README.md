@@ -36,9 +36,9 @@ pnpm tauri dev
 
 1. 在桌面端「仓库管理」点击「选择文件夹…」（或直接填写绝对路径），再用「添加后启用推送保护」复选框决定初始状态，然后添加。GitGuard 会安装 `pre-push` Hook，并把本次登记的仓库 id 写进脚本；若已存在其它 `pre-push`，先备份为 `pre-push.gitguard-backup`，再写入链式调用脚本。对已登记的路径，添加只刷新 Hook 脚本，开关与仓库 id 沿用原记录。
 2. 在该仓库执行 `git push`。确认通道按运行环境自动选择：
-   - **在终端里执行**：Hook 直接在当前终端列出 remote、目标分支与待推送 commit（含作者与提交时间）；分支名使用 `git branch` 里的简称（如 `branch: test`，改名推送才显示 `local -> remote`），输入 `y`/`yes` 才放行；内容超过一屏时分页显示。
+   - **在终端里执行**：Hook 直接在当前终端列出 remote、目标分支与待推送 commit（含作者与提交时间）；分支名使用 `git branch` 里的简称（如 `branch: test`，改名推送才显示 `local -> remote`），输入 `y`/`yes` 才放行；内容超过一屏时分页显示。每个 ref 会标出 `(create)`、`(update)`、`(rewrite)` 或 `(delete)`。
    - **在 SourceTree、Fork、VS Code 等图形客户端里执行**：Hook 进程没有控制终端，改为通过本地 Unix Domain Socket 请求桌面端确认。
-3. 桌面端展示 remote 名称与 URL、目标 ref、待推送 commit 列表和倒计时；必须手工输入 `yes` 才能确认。
+3. 桌面端展示 remote 名称与 URL、目标 ref、待推送 commit 列表和倒计时，非快进更新标为改写风险；必须手工输入 `yes` 才能确认。
 4. 确认后 CLI 重新校验 ref 未变化，再以退出码 0 放行，由原本的 `git push` 继续推送（终端或客户端里能看到真实的推送进度与凭据交互）；取消或超时则本次 push 被拒绝，远端不变。
 
 终端确认界面的操作方式：
@@ -50,7 +50,7 @@ pnpm tauri dev
 | `m`         | 下一页（每页 30 行）       |
 | `b`         | 上一页                     |
 
-等待确认的上限与桌面端相同，取配置里的 `confirmation_timeout_seconds`；超时、输入流结束（EOF）或无法识别的输入都不会被当作确认。终端界面用颜色区分关键信息：分支名、提交标题与键位加粗，新建绿、更新黄、删除红，标签与时间用暗色；设置 `NO_COLOR` 或 `TERM=dumb` 时自动退化为纯文本。终端里展示的分支名、commit 主题与 remote URL 会先过滤控制字符与 ANSI 转义序列，URL 中的用户名/密码替换为 `***`，避免伪造界面或泄漏凭据。
+等待确认的上限与桌面端相同，取配置里的 `confirmation_timeout_seconds`；超时、输入流结束（EOF）或无法识别的输入都不会被当作确认。终端界面用颜色区分关键信息：分支名、提交标题与键位加粗，新建绿、更新黄、改写与删除红，标签与时间用暗色；设置 `NO_COLOR` 或 `TERM=dumb` 时自动退化为纯文本。非快进更新（`--force`、`--force-with-lease` 或 refspec 里的 `+`）标为 `(rewrite)`，提示若远端接受本次推送，远端已有但本地没有的提交会被丢弃；tag 更新一律按改写展示。祖先关系无法判断时（对象存在但不是 commit、Git 比对失败）也按改写展示；远端对象在本地缺失时提交列表本身就列不出，按既有规则拒绝本次推送，不会展示标记。该标记是客户端根据祖先关系的推断，不能区分 `--force` 与普通分叉推送，只影响提示，不改变放行判断。终端里展示的分支名、commit 主题与 remote URL 会先过滤控制字符与 ANSI 转义序列，URL 中的用户名/密码替换为 `***`，避免伪造界面或泄漏凭据。
 
 图形客户端不会显示 Hook 的输出，因此点击「推送」后客户端可能看起来停在「推送中」：此时应切到 GitGuard 桌面端确认或取消。有新请求时 GitGuard 会把窗口切到前台并请求系统注意力提示，超时后客户端会收到钩子失败的结果。
 
@@ -185,6 +185,7 @@ cargo test --workspace
 - [AGENTS.md](AGENTS.md)：AI 编码代理的执行约定、仓库地图与自检清单。
 - [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)：开发规范，包含环境、提交信息、代码规范、测试要求与安全清单。
 - [docs/develop/GitGuard-MVP-路线图.md](docs/develop/GitGuard-MVP-路线图.md)：阶段目标、里程碑、测试矩阵与未实现清单；桌面端页面结构见 [界面规范](docs/develop/GitGuard-桌面端-信息架构与交互设计.md)。
+- [docs/develop/GitGuard-待办清单.md](docs/develop/GitGuard-待办清单.md)：路线图的派生快照，只记当前实现状态与待办顺序。
 
 ## 工程边界与已知限制
 

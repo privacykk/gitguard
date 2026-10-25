@@ -212,6 +212,8 @@ const zhCN = {
     kind: {
       create: "将创建新的远端分支",
       update: "将更新远端分支",
+      rewrite:
+        "非快进更新：若远端接受本次推送，远端已有但本地没有的提交将被丢弃（通常是 --force / --force-with-lease）",
       delete: "将删除远端分支",
     },
     yesLabel: "要执行本次推送，请输入 yes",

@@ -11,7 +11,10 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 
+use gitguard_core::{ConfirmationDecision, PushConfirmationRequest, PushConfirmationResponse};
+use gitguard_ipc::{IpcHandler, IpcServer};
 use tempfile::TempDir;
 
 /// 测试配置里固定的仓库 id。
@@ -165,6 +168,21 @@ impl GitFixture {
             serde_json::to_vec_pretty(&config).expect("serialize test config"),
         )
         .expect("write test config");
+    }
+
+    /// 返回隔离 HOME 下与被测进程一致的 IPC socket 路径。
+    ///
+    /// `dirs::config_dir()` 在 macOS 用 `~/Library/Application Support`，
+    /// 其余 Unix 用 `$XDG_CONFIG_HOME`（`run_cli` 已把它指向临时目录）。
+    fn socket_path(&self, home: &Path) -> PathBuf {
+        let config_dir = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support")
+        } else {
+            home.join(".config")
+        };
+        config_dir
+            .join("dev.gitguard.desktop")
+            .join("gitguard.sock")
     }
 
     /// 安装不带 `--policy` 的真实模式 Hook（Git 会额外追加 remote 参数）。
@@ -552,4 +570,116 @@ fn legacy_controlled_push_marker_no_longer_bypasses_confirmation() {
         .success(),
         "被拒绝的 push 不得在远端留下 ref"
     );
+}
+
+/// 测试用 IPC 处理器：总是返回 `Confirmed`，用来验证确认路径本身。
+struct ConfirmingHandler;
+
+impl IpcHandler for ConfirmingHandler {
+    fn handle_push_request(&self, request: PushConfirmationRequest) -> PushConfirmationResponse {
+        PushConfirmationResponse {
+            request_id: request.request_id,
+            decision: ConfirmationDecision::Confirmed,
+            message: "approved in test".to_string(),
+        }
+    }
+}
+
+/// 创建短路径的隔离 HOME。
+///
+/// Unix socket 的 `sun_path` 有长度上限（macOS 必须 < 104 字节），系统默认
+/// 临时目录太深，因此只在 /tmp 下为 HOME 建临时目录；仓库仍在 fixture 里。
+fn short_isolated_home() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("gitguard-home-")
+        .tempdir_in("/tmp")
+        .expect("create a short isolated home")
+}
+
+#[test]
+fn confirmed_non_fast_forward_update_exits_zero_without_pushing() {
+    // 回归：风险标记只用于展示，不得改变结论。非快进更新在用户确认后仍
+    // 必须返回 0，由原来的 git push 完成推送；CLI 自己不得执行 push。
+    let fixture = GitFixture::new();
+    let home_dir = short_isolated_home();
+    let home = home_dir.path();
+    fixture.write_config(home, true);
+
+    // 先建立远端基线，再让远端多出一个本地没有的提交。
+    assert!(fixture.push(&["push", "origin", "main"]).status.success());
+    let base = String::from_utf8(git(&fixture.work, &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 oid")
+        .trim()
+        .to_owned();
+    fixture.commit_change("remote only change\n");
+    assert!(fixture.push(&["push", "origin", "main"]).status.success());
+    let remote = String::from_utf8(git(&fixture.remote, &["rev-parse", "refs/heads/main"]).stdout)
+        .expect("UTF-8 oid")
+        .trim()
+        .to_owned();
+    git(&fixture.work, &["reset", "--hard", &base]);
+
+    let server = IpcServer::start(fixture.socket_path(home), Arc::new(ConfirmingHandler))
+        .expect("start the stub IPC server");
+    let stdin = format!("refs/heads/main {base} refs/heads/main {remote}\n");
+    let output = fixture.run_cli(
+        home,
+        &["hook", "pre-push", "origin", "file:///tmp/remote.git"],
+        &stdin,
+        &[],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "确认后应固定退出码 0，实际: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("confirmed"));
+    // CLI 只返回 0，不自己 push：远端必须仍停在确认时的 OID。
+    assert_eq!(
+        fixture.remote_oid("refs/heads/main"),
+        format!("{remote}\n").as_bytes()
+    );
+
+    drop(server);
+}
+
+#[test]
+fn confirmed_force_push_updates_the_remote() {
+    // 端到端：真实 `git push --force` → Hook 请求确认 → 桩服务返回 Confirmed
+    // → CLI 返回 0 → 原 git push 完成唯一一次推送。
+    let fixture = GitFixture::new();
+    let home_dir = short_isolated_home();
+    let home = home_dir.path();
+    fixture.write_config(home, true);
+
+    // 先用调试模式建立远端基线，再让远端领先于本地。
+    fixture.install_policy("allow");
+    assert!(fixture.push(&["push", "origin", "main"]).status.success());
+    let base = String::from_utf8(git(&fixture.work, &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 oid")
+        .trim()
+        .to_owned();
+    fixture.commit_change("remote only change\n");
+    assert!(fixture.push(&["push", "origin", "main"]).status.success());
+    git(&fixture.work, &["reset", "--hard", &base]);
+
+    fixture.install_real_hook();
+    let server = IpcServer::start(fixture.socket_path(home), Arc::new(ConfirmingHandler))
+        .expect("start the stub IPC server");
+    let output = fixture.push_with_home(home, &["push", "--force", "origin", "main"]);
+
+    assert!(
+        output.status.success(),
+        "确认后的强制推送应成功: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // 推送由原 git push 完成：远端 ref 变为确认时的本地 OID。
+    assert_eq!(
+        fixture.remote_oid("refs/heads/main"),
+        format!("{base}\n").as_bytes()
+    );
+
+    drop(server);
 }

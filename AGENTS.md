@@ -41,7 +41,7 @@ GitGuard 是本地优先的 Git 推送保护工具。前端为 Vue 3 + TypeScrip
 | `crates/gitguard-ipc`      | Unix Domain Socket 的 JSON 传输层、超时与 socket 权限（`0600`），不做策略                                                                    |
 | `crates/gitguard-hook`     | `pre-push` Hook 安装/卸载/健康检查与备份链式调用；把桌面端分配的仓库 id 写入脚本（只接受 UUID 字符集），不判断是否推送                       |
 | `crates/gitguard-cli`      | 参数校验（`--repository-id` / `--policy`）、完整读取 stdin、逐行解析 ref、按 id / 路径 / 全局开关判定、选择通道、退出码映射（`gitguard`）    |
-| `crates/gitguard-git`      | 仓库根路径、Hook 目录、提交列表、ref 预校验（`Command` 参数数组，不执行 push，不做策略）                                                     |
+| `crates/gitguard-git`      | 仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断（`Command` 参数数组，不执行 push，不做策略）                                       |
 | `apps/desktop/src`         | Vue 界面、侧边栏页面导航（`navigation.ts`）、i18n 语言包、状态码映射与返回值形状校验、`components/ui` 公共展示组件，只展示状态，不做策略判断 |
 | `apps/desktop/src-tauri`   | `AppState`、IPC 服务端、Tauri commands、原生菜单构建（`menu.rs`）；确认时只回 `Confirmed`，不执行 Git                                        |
 | `docs/`                    | 架构、安全、开发规范、MVP 路线图与桌面端界面规范                                                                                             |
@@ -81,7 +81,7 @@ gitguard-cli ⇄ Unix Domain Socket ⇄ Tauri commands
 - `gitguard-policy`：纯策略判断；不得访问 UI/数据库、弹窗、执行命令、读取时间或随机数；无法判断时不得返回 `Allow`。仅在 `--policy` 调试模式下使用。
 - `gitguard-cli`：只做协议层工作（参数、stdin、ref 解析、选择确认通道、退出码映射）；不得吞掉错误返回成功，不得把未校验输入拼进 shell 命令；确认通过后必须重新校验 ref 并以 0 放行，让原 `git push` 完成唯一一次推送，不得自己再执行 push。
 - `gitguard-cli` 的终端界面：交互只读写 `/dev/tty`（Hook stdin 已被 Git 占用），渲染前必须过滤控制字符、ANSI 与 bidi 控制符并脱敏 URL 凭据；分页、超时与未知输入都不得被视为确认。
-- `gitguard-git`：只封装 Git 调用（仓库根路径、Hook 目录、提交列表、ref 预校验）；不判断策略，不拼 shell，不执行 push，统一设置 `GIT_TERMINAL_PROMPT=0`，OID 与 ref 先校验再传给 Git。
+- `gitguard-git`：只封装 Git 调用（仓库根路径、Hook 目录、提交列表、ref 预校验、祖先关系判断）；不判断策略，不拼 shell，不执行 push，统一设置 `GIT_TERMINAL_PROMPT=0`，OID 与 ref 先校验再传给 Git。
 - `gitguard-ipc`：只搬运请求/响应；通信失败一律返回 `IpcError`，不得把「没有响应」当成确认。
 - `gitguard-hook`：只管理 Hook 文件；不得覆盖未备份的用户 Hook，不得启动常驻进程；写进脚本的仓库 id 必须校验字符集与长度，不得把未过滤的外部字符串拼进脚本。
 - `apps/desktop/src-tauri`：不实现策略，也不执行 Git 命令；确认时先重新校验 ref 再回 `Confirmed`，推送由原 `git push` 完成。原生菜单（`menu.rs`）只做国际化与「设置…」导航，不得新增任何绕开 Hook 的入口。

@@ -56,13 +56,20 @@ describe("parsePushConfirmation", () => {
     expect(parsed?.refs[0]?.commits[0]?.shortSha).toBe("0123456");
   });
 
+  it("keeps the rewrite kind that flags force updates", () => {
+    const request = validRequest();
+    request.refs[0].kind = "rewrite";
+
+    expect(parsePushConfirmation(request)?.refs[0]?.kind).toBe("rewrite");
+  });
+
   it("rejects payloads that would let the UI confirm an unknown push", () => {
     const withoutRequestId = validRequest();
     delete (withoutRequestId as Record<string, unknown>).requestId;
     expect(parsePushConfirmation(withoutRequestId)).toBeNull();
 
     const unknownKind = validRequest();
-    unknownKind.refs[0].kind = "force";
+    unknownKind.refs[0].kind = "mirror";
     expect(parsePushConfirmation(unknownKind)).toBeNull();
 
     const missingCommitField = validRequest();

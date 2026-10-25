@@ -1,8 +1,8 @@
 //! Git 操作层：把 GitGuard 需要的 Git 调用集中在一个 crate 里。
 //!
 //! 依赖方向是 `gitguard-git → gitguard-core`：本 crate 只负责读取仓库信息、
-//! 列出待推送的提交、校验 ref 是否变化，不做任何策略判断，不执行 push，
-//! 也不依赖 Tauri、Vue 或数据库。
+//! 列出待推送的提交、校验 ref 是否变化、判断对象祖先关系（仅用于风险提示），
+//! 不做任何策略判断，不执行 push，也不依赖 Tauri、Vue 或数据库。
 //!
 //! 所有命令都通过 [`std::process::Command`] 的参数数组执行，不经过 shell；
 //! 每个命令都设置 `GIT_TERMINAL_PROMPT=0`，避免在无人值守时卡在凭据输入上。
@@ -137,6 +137,58 @@ pub fn list_commits(
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| GitGuardError::Internal("git log output is not valid UTF-8".into()))?;
     Ok(parse_commit_lines(&stdout))
+}
+
+/// 判断 `ancestor_oid` 是否是 `descendant_oid` 的祖先。
+///
+/// 用于识别「非快进更新」：目标远端已有的提交如果不在本地历史里，这次推送会
+/// 改写远端历史（`--force`、`--force-with-lease` 或 refspec 里的 `+`）。
+/// 两个 OID 都先校验形状；Git 无法回答（对象缺失、仓库异常）时返回错误，
+/// 调用方必须按「无法判断」处理，不能当成普通的快进更新。
+pub fn is_ancestor(repo_path: &Path, ancestor_oid: &str, descendant_oid: &str) -> Result<bool> {
+    if !valid_oid(ancestor_oid) || !valid_oid(descendant_oid) {
+        return Err(GitGuardError::InvalidInput(
+            "object IDs must be 40 or 64 hexadecimal characters".into(),
+        ));
+    }
+
+    let output = run_git(
+        repo_path,
+        &["merge-base", "--is-ancestor", ancestor_oid, descendant_oid],
+    )?;
+    match output.status.code() {
+        // Git 用退出码表达结论：0 是祖先，1 不是，其它都是执行失败。
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitGuardError::Internal(format!(
+            "could not compare object ancestry: {}",
+            stderr_text(&output)
+        ))),
+    }
+}
+
+/// 本次 ref 更新是否会丢弃目标远端已有的提交（历史改写）。
+///
+/// 只用于界面上的风险提示，不参与任何放行判断：
+/// - 新建与删除不是改写；
+/// - tag 按约定不可变，更新已有 tag 一定会替换远端对象，按改写处理；
+/// - 远端 OID 是本地 OID 的祖先时是快进，不是改写；
+/// - 无法判断时按「可能改写」返回 `true`，宁可多提示一次，也不把未知情况
+///   显示成普通更新。
+pub fn rewrites_remote_history(repo_path: &Path, update: &RefUpdate) -> bool {
+    if update.is_deletion() || update.is_creation() {
+        return false;
+    }
+    // `merge-base --is-ancestor` 会把 annotated tag peel 成 commit，只看祖先关系
+    // 会把「把 tag 强移到其后代」误判为快进；tag 更新没有快进语义，一律提示。
+    if update.remote_ref.starts_with("refs/tags/") {
+        return true;
+    }
+
+    !matches!(
+        is_ancestor(repo_path, &update.remote_oid, &update.local_oid),
+        Ok(true)
+    )
 }
 
 /// 确认「用户看到并同意的 ref」在执行 push 前没有变化。
@@ -513,6 +565,109 @@ mod tests {
             list_commits(&repo.root, "origin", "not-an-oid", OID_B),
             Err(GitGuardError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn detects_whether_one_commit_is_an_ancestor_of_another() {
+        let repo = TestRepo::new();
+        let base = repo.commit("base commit");
+        let next = repo.commit("next commit");
+
+        assert!(is_ancestor(&repo.root, &base, &next).expect("ancestry should resolve"));
+        assert!(!is_ancestor(&repo.root, &next, &base).expect("ancestry should resolve"));
+        // 对象不存在时 Git 无法给出结论，必须报错而不是猜一个答案。
+        assert!(matches!(
+            is_ancestor(&repo.root, OID_A, &next),
+            Err(GitGuardError::Internal(_))
+        ));
+        assert!(matches!(
+            is_ancestor(&repo.root, "not-an-oid", &next),
+            Err(GitGuardError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn flags_only_non_fast_forward_updates_as_history_rewrites() {
+        let repo = TestRepo::new();
+        let base = repo.commit("base commit");
+        // 从 base 分叉出另一条历史，模拟远端已有本地没有的提交。
+        git(&repo.root, &["checkout", "-b", "remote-only", &base]);
+        let remote = repo.commit("remote only commit");
+        git(&repo.root, &["checkout", "main"]);
+        let local = repo.commit("local only commit");
+
+        let fast_forward = RefUpdate {
+            local_ref: "refs/heads/main".into(),
+            local_oid: local.clone(),
+            remote_ref: "refs/heads/main".into(),
+            remote_oid: base.clone(),
+        };
+        assert!(!rewrites_remote_history(&repo.root, &fast_forward));
+
+        let rewrite = RefUpdate {
+            remote_oid: remote.clone(),
+            ..fast_forward.clone()
+        };
+        assert!(rewrites_remote_history(&repo.root, &rewrite));
+
+        // 新建与删除不会丢弃远端提交。
+        let creation = RefUpdate {
+            remote_oid: ZERO_OID.into(),
+            ..fast_forward.clone()
+        };
+        assert!(!rewrites_remote_history(&repo.root, &creation));
+
+        let deletion = RefUpdate {
+            local_ref: "(delete)".into(),
+            local_oid: ZERO_OID.into(),
+            remote_ref: "refs/heads/main".into(),
+            remote_oid: remote,
+        };
+        assert!(!rewrites_remote_history(&repo.root, &deletion));
+    }
+
+    #[test]
+    fn treats_every_tag_update_as_a_history_rewrite() {
+        // annotated tag 会被 peel 成 commit：只比祖先关系时，「把 tag 强移到后代」
+        // 会被误判为快进。tag 更新一定会替换远端对象，必须提示改写。
+        let repo = TestRepo::new();
+        let base = repo.commit("base commit");
+        let next = repo.commit("next commit");
+        git(&repo.root, &["tag", "-a", "v1", "-m", "v1", &base]);
+        git(&repo.root, &["tag", "-a", "v2", "-m", "v2", &next]);
+        let old = git_stdout(&repo.root, &["rev-parse", "refs/tags/v1"])
+            .trim()
+            .to_owned();
+        let new = git_stdout(&repo.root, &["rev-parse", "refs/tags/v2"])
+            .trim()
+            .to_owned();
+        assert!(
+            is_ancestor(&repo.root, &old, &new).expect("tags should peel to commits"),
+            "前提：两个 tag 指向的 commit 是祖先关系"
+        );
+
+        let update = RefUpdate {
+            local_ref: "refs/tags/v2".into(),
+            local_oid: new,
+            remote_ref: "refs/tags/v2".into(),
+            remote_oid: old,
+        };
+        assert!(rewrites_remote_history(&repo.root, &update));
+    }
+
+    #[test]
+    fn unknown_ancestry_is_treated_as_a_rewrite_risk() {
+        // 远端 OID 在本地缺失时无法判断，用于展示时按「可能改写」处理。
+        let repo = TestRepo::new();
+        let head = repo.commit("initial commit");
+        let update = RefUpdate {
+            local_ref: "refs/heads/main".into(),
+            local_oid: head,
+            remote_ref: "refs/heads/main".into(),
+            remote_oid: OID_A.into(),
+        };
+
+        assert!(rewrites_remote_history(&repo.root, &update));
     }
 
     #[test]

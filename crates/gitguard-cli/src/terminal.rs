@@ -96,7 +96,7 @@ impl Paint {
         self.style("33", text)
     }
 
-    /// 删除 ref：红色。
+    /// 删除 ref 与历史改写（非快进）：红色。
     fn danger(&self, text: &str) -> String {
         self.style("31", text)
     }
@@ -106,6 +106,8 @@ impl Paint {
 pub(crate) struct PreviewRef {
     pub update: RefUpdate,
     pub commits: Vec<CommitInfo>,
+    /// 本次更新会丢弃远端已有的提交（非快进），仅用于风险提示。
+    pub rewrites_history: bool,
 }
 
 /// 终端确认所需的全部展示数据。
@@ -318,6 +320,9 @@ fn render(preview: &Preview, paint: &Paint) -> Vec<String> {
             paint.danger("(delete)")
         } else if update.is_creation() {
             paint.ok("(create)")
+        } else if entry.rewrites_history {
+            // 非快进更新（--force / --force-with-lease / +refspec）会丢弃远端提交。
+            paint.danger("(rewrite)")
         } else {
             paint.warn("(update)")
         };
@@ -587,6 +592,7 @@ mod tests {
             &preview(vec![PreviewRef {
                 update: update("refs/heads/main", "b".repeat(40).as_str()),
                 commits: vec![commit("feat: add confirmation")],
+                rewrites_history: false,
             }]),
             &Paint::plain(),
         );
@@ -611,6 +617,7 @@ mod tests {
                 PreviewRef {
                     update: update("refs/heads/new", ZERO_OID),
                     commits: Vec::new(),
+                    rewrites_history: false,
                 },
                 PreviewRef {
                     update: RefUpdate {
@@ -620,6 +627,7 @@ mod tests {
                         remote_oid: "b".repeat(40),
                     },
                     commits: Vec::new(),
+                    rewrites_history: false,
                 },
             ]),
             &Paint::plain(),
@@ -631,6 +639,21 @@ mod tests {
         // 删除时 Git 传入的 `(delete)` 占位符不能被当成分支名展示。
         assert!(!text.contains("(delete) ->"));
         assert!(text.contains("(no commits to list)"));
+    }
+
+    #[test]
+    fn render_flags_history_rewrites_separately_from_plain_updates() {
+        // 强制更新（非快进）会丢弃远端提交，必须与普通 update 区分。
+        let lines = render(
+            &preview(vec![PreviewRef {
+                update: update("refs/heads/main", "b".repeat(40).as_str()),
+                commits: Vec::new(),
+                rewrites_history: true,
+            }]),
+            &Paint::plain(),
+        );
+
+        assert!(lines.join("\n").contains("branch: main (rewrite)"));
     }
 
     #[test]
@@ -656,6 +679,7 @@ mod tests {
                     remote_oid: "b".repeat(40),
                 },
                 commits: Vec::new(),
+                rewrites_history: false,
             }]),
             &Paint::plain(),
         );
@@ -687,6 +711,7 @@ mod tests {
             &preview(vec![PreviewRef {
                 update: update("refs/heads/main", ZERO_OID),
                 commits: vec![commit("\u{1b}[31mred \u{1b}[2Jclear")],
+                rewrites_history: false,
             }]),
             &painted,
         );
@@ -706,6 +731,7 @@ mod tests {
             &preview(vec![PreviewRef {
                 update: update("refs/heads/main", ZERO_OID),
                 commits: vec![commit("\u{1b}[31mred\u{1b}[0m \u{202e}reversed")],
+                rewrites_history: false,
             }]),
             &Paint::plain(),
         );
@@ -723,6 +749,7 @@ mod tests {
             &preview(vec![PreviewRef {
                 update: update("refs/heads/main", ZERO_OID),
                 commits: vec![commit(&"a".repeat(MAX_SUBJECT_CHARS + 10))],
+                rewrites_history: false,
             }]),
             &Paint::plain(),
         );

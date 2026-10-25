@@ -19,8 +19,13 @@ export interface CommitInfo {
   subject: string;
 }
 
-/** ref 更新的类型，决定界面上的风险提示。 */
-export type RefKind = "create" | "update" | "delete";
+/**
+ * ref 更新的类型，决定界面上的风险提示。
+ *
+ * `rewrite` 表示本次更新会丢弃远端已有的提交（`--force` / `--force-with-lease`
+ * 或 refspec 里的 `+`），只用于展示风险，不参与任何放行判断。
+ */
+export type RefKind = "create" | "update" | "rewrite" | "delete";
 
 /** 单个 ref 的待推送内容。 */
 export interface RefPreview {
@@ -73,7 +78,7 @@ export class GitGuardCommandError extends Error {
   }
 }
 
-const REF_KINDS: readonly RefKind[] = ["create", "update", "delete"];
+const REF_KINDS: readonly RefKind[] = ["create", "update", "rewrite", "delete"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

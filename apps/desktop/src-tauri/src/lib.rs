@@ -105,7 +105,7 @@ struct PushConfirmationView {
 struct RefPreviewView {
     local_ref: String,
     remote_ref: String,
-    /// `create` / `update` / `delete`；前端据此提示风险，不参与任何判定。
+    /// `create` / `update` / `rewrite` / `delete`；前端据此提示风险，不参与任何判定。
     kind: &'static str,
     commits: Vec<CommitInfo>,
 }
@@ -497,6 +497,9 @@ impl AppState {
                 "delete"
             } else if update.is_creation() {
                 "create"
+            } else if gitguard_git::rewrites_remote_history(repo, update) {
+                // 非快进更新会丢弃远端提交；无法判断时也归入此类，宁可多提示。
+                "rewrite"
             } else {
                 "update"
             };
@@ -887,15 +890,19 @@ mod tests {
         }
     }
 
-    fn git(cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
+    fn try_git(cwd: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
             .args(args)
             .current_dir(cwd)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
-            .expect("execute git");
+            .expect("execute git")
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = try_git(cwd, args);
         assert!(
             output.status.success(),
             "git {args:?} failed:\nstderr: {}",
@@ -903,9 +910,77 @@ mod tests {
         );
     }
 
+    /// 运行 Git 并要求成功，返回 UTF-8 stdout。
+    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+        let output = try_git(cwd, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git stdout should be UTF-8")
+    }
+
+    /// 在临时仓库里提交一次并返回完整 OID，用于构造快进/非快进的 ref 更新。
+    fn commit(repo: &TestRepo, subject: &str) -> String {
+        fs::write(repo.root.join("file.txt"), format!("{subject}\n")).expect("write test file");
+        git(&repo.root, &["add", "file.txt"]);
+        git(&repo.root, &["commit", "-m", subject]);
+        git_stdout(&repo.root, &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned()
+    }
+
     /// 建立一个使用临时配置文件的状态，绝不读写用户真实配置。
     fn temp_state(temp: &TempDir) -> AppState {
         AppState::new(temp.path().join("config.json"))
+    }
+
+    #[test]
+    fn push_preview_marks_non_fast_forward_updates_as_rewrites() {
+        // 预览只负责提示风险：快进显示 update，非快进（强制更新）显示 rewrite。
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let state = temp_state(&temp);
+        let repo = TestRepo::new();
+        git(&repo.root, &["config", "user.name", "GitGuard Test"]);
+        git(
+            &repo.root,
+            &["config", "user.email", "gitguard@example.invalid"],
+        );
+        let base = commit(&repo, "base commit");
+        git(&repo.root, &["checkout", "-b", "remote-only", &base]);
+        let remote = commit(&repo, "remote only commit");
+        git(&repo.root, &["checkout", "main"]);
+        let local = commit(&repo, "local only commit");
+
+        let request = PushConfirmationRequest {
+            request_id: "request-1".into(),
+            repository_path: repo.root.to_string_lossy().into_owned(),
+            remote_name: "origin".into(),
+            remote_url: "git@example.com:team/project.git".into(),
+            ref_updates: vec![
+                gitguard_core::RefUpdate {
+                    local_ref: "refs/heads/main".into(),
+                    local_oid: local.clone(),
+                    remote_ref: "refs/heads/main".into(),
+                    remote_oid: remote,
+                },
+                gitguard_core::RefUpdate {
+                    local_ref: "refs/heads/topic".into(),
+                    // 真正的快进：远端只有 base，本地已经包含它。
+                    local_oid: local,
+                    remote_ref: "refs/heads/topic".into(),
+                    remote_oid: base,
+                },
+            ],
+            timestamp_epoch_secs: 0,
+        };
+
+        let view = state
+            .build_view(&request, MIN_TIMEOUT_SECONDS)
+            .expect("preview should build");
+        assert_eq!(view.refs[0].kind, "rewrite");
+        assert_eq!(view.refs[1].kind, "update");
     }
 
     /// 往状态里放一条待确认请求，返回等待决定的一端；`deadline` 用于模拟超时。

@@ -220,6 +220,8 @@ fn build_terminal_preview(
         refs.push(terminal::PreviewRef {
             update: update.clone(),
             commits,
+            // 只影响风险提示：无法判断时按「可能改写」展示，不改变放行结果。
+            rewrites_history: gitguard_git::rewrites_remote_history(repo_path, update),
         });
     }
 
@@ -448,7 +450,9 @@ fn exit_code_for_error(error: &GitGuardError) -> CliExitCode {
 // 单元测试直接调用 `run` 与解析函数，用 `Cursor` 模拟 stdin，不触碰真实 IO。
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{self, Cursor};
+    use std::process::Command;
 
     use super::*;
 
@@ -681,6 +685,84 @@ mod tests {
         let message = String::from_utf8(stderr).expect("stderr should be UTF-8");
         assert!(message.contains("confirmed"));
         assert!(!message.contains("rejected"));
+    }
+
+    /// 运行 Git 并返回原始输出；三个环境变量隔离用户配置与交互提示。
+    fn try_git(cwd: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("execute git")
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = try_git(cwd, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 在临时仓库里提交一次并返回完整 OID。
+    fn commit(root: &Path, subject: &str) -> String {
+        fs::write(root.join("file.txt"), format!("{subject}\n")).expect("write test file");
+        git(root, &["add", "file.txt"]);
+        git(root, &["commit", "-m", subject]);
+        let output = try_git(root, &["rev-parse", "HEAD"]);
+        assert!(output.status.success(), "rev-parse HEAD failed");
+        String::from_utf8(output.stdout)
+            .expect("git stdout should be UTF-8")
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn terminal_preview_marks_non_fast_forward_updates_as_rewrites() {
+        // 接线测试：build_terminal_preview 必须把祖先关系结论传进 rewrites_history，
+        // 且两处调用共用同一个判断（写反参数会让这里的断言失败）。
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).expect("create repository directory");
+        git(&root, &["init", "-b", "main"]);
+        git(&root, &["config", "user.name", "GitGuard Test"]);
+        git(&root, &["config", "user.email", "gitguard@example.invalid"]);
+        let base = commit(&root, "base commit");
+        git(&root, &["checkout", "-b", "remote-only", &base]);
+        let remote = commit(&root, "remote only commit");
+        git(&root, &["checkout", "main"]);
+        let local = commit(&root, "local only commit");
+
+        let args = HookArgs {
+            policy: None,
+            repository_id: None,
+            remote_name: Some("origin".into()),
+            remote_url: Some("file:///tmp/remote.git".into()),
+        };
+        let updates = [
+            // 远端有本地没有的提交：非快进。
+            RefUpdate {
+                local_ref: "refs/heads/main".into(),
+                local_oid: local.clone(),
+                remote_ref: "refs/heads/main".into(),
+                remote_oid: remote,
+            },
+            // 远端提交是本地提交的祖先：快进。
+            RefUpdate {
+                local_ref: "refs/heads/topic".into(),
+                local_oid: local,
+                remote_ref: "refs/heads/topic".into(),
+                remote_oid: base,
+            },
+        ];
+
+        let preview = build_terminal_preview(&root, &args, &updates).expect("preview should build");
+        assert!(preview.refs[0].rewrites_history);
+        assert!(!preview.refs[1].rewrites_history);
     }
 
     #[test]
